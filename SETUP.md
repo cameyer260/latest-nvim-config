@@ -223,3 +223,75 @@ Formatting via `conform` (`<leader>f`): `prettierd` for the web stack, `ruff` fo
 - This is a git repo (`git init` was run, kickstart's history removed). Commit it so it's
   yours: `cd ~/.config/nvim && git add -A && git commit -m "initial setup"`.
 - Run `:Tutor` once if you want a Neovim motions refresher.
+
+---
+
+## 8. Dump LSP diagnostics for an AI to fix
+
+The orange underlines and `W`/`E` markers in the gutter are LSP **diagnostics** (warnings/
+errors about the *code*) — not git changes and not "unsaved edits". When they pile up, you can
+export them all to a plain file and hand it to an AI agent ("read this file and fix every
+issue"). They're the merged output of every attached server (`ts_ls`, `tailwindcss`, `astro`,
+`eslint`, …); there's no single CLI that reproduces them (notably, tailwind's class warnings
+**only** exist in the language server), so the trick is to let Neovim itself produce them.
+
+### The `nvim-diag` script
+
+Launches Neovim headlessly with *this* config, opens the files so every server attaches, waits
+for them to report, collects the diagnostics, and copies them to the clipboard (via `pbcopy`) —
+then you just paste into the AI. Nothing is left on disk: it routes through a temp file that's
+deleted on exit. Save as `~/.local/bin/nvim-diag` and `chmod +x` it:
+
+```bash
+#!/usr/bin/env bash
+# nvim-diag — copy Neovim LSP diagnostics to the clipboard for an AI to fix.
+#   nvim-diag                  # all git-tracked files in the current repo
+#   nvim-diag src/**/*.astro   # just these files/globs
+set -euo pipefail
+
+# macOS defaults to a 256 open-file limit; opening a whole repo + spawning the
+# language servers blows past it (EMFILE). Raise it as high as the shell allows.
+for n in 10240 8192 4096 2048; do ulimit -n "$n" 2>/dev/null && break; done
+
+if [[ $# -gt 0 ]]; then
+  files=("$@")
+else
+  files=()
+  while IFS= read -r f; do files+=("$f"); done < <(git ls-files)   # macOS Bash 3.2 has no `mapfile`
+fi
+[[ ${#files[@]} -eq 0 ]] && { echo "no files to scan"; exit 1; }
+
+# Ephemeral scratch file: written by nvim, copied to the clipboard, then removed.
+tmpdir="${TMPDIR:-/tmp}"; export NVIM_DIAG_OUT="${tmpdir%/}/nvim-diag-$$.txt"
+trap 'rm -f "$NVIM_DIAG_OUT"' EXIT
+
+nvim --headless -n "${files[@]}" \
+  -c 'set shortmess+=A' \
+  -c 'silent! argdo edit' \
+  -c 'lua vim.wait(15000, function() return #vim.lsp.get_clients() > 0 end, 200); vim.wait(5000)' \
+  -c 'lua local o=os.getenv("NVIM_DIAG_OUT"); local L={}; for _,d in ipairs(vim.diagnostic.get(nil)) do if d.severity<=vim.diagnostic.severity.WARN then local f=vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr),":."); L[#L+1]=string.format("%s:%d:%d: [%s] %s (%s)",f,d.lnum+1,d.col+1,vim.diagnostic.severity[d.severity],d.message:gsub("%s+"," "),d.source or "") end end; table.sort(L); vim.fn.writefile(L,o); io.stderr:write(#L.." diagnostics\n")' \
+  -c 'qa!' || true   # nvim may exit nonzero on LSP noise; we still want the output
+
+[[ -f "$NVIM_DIAG_OUT" ]] || { echo "no output produced"; exit 1; }
+pbcopy < "$NVIM_DIAG_OUT"   # macOS clipboard; swap for wl-copy/xclip on Linux
+echo "$(grep -c . "$NVIM_DIAG_OUT") diagnostics copied to clipboard"
+```
+
+Run it from inside any project, then just **paste** into the AI ("fix every warning/error"):
+
+```bash
+nvim-diag        # scans tracked files → copies to clipboard, prints the count
+```
+
+Each clipboard line is `file:line:col: [SEVERITY] message (source)`:
+
+```
+src/pages/index.astro:142:18: [WARN] 'p-4' applies the same properties as 'px-2' (tailwindcss)
+src/lib/util.ts:9:7: [ERROR] 'foo' is declared but never used (typescript)
+```
+
+- It only reports the files you pass in (LSPs analyze open buffers only) — the default
+  `git ls-files` covers the repo; a single arg gives just that file.
+- `d.severity<=WARN` keeps errors + warnings; remove that check to include hints/info.
+- First run in a new project pauses while Mason's servers attach — that's the `vim.wait`.
+- `pbcopy` is macOS-only; on Linux swap it for `wl-copy` (Wayland) or `xclip -selection clipboard`.
