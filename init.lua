@@ -361,6 +361,33 @@ do
       topdelete = { text = '‾' }, ---@diagnostic disable-line: missing-fields
       changedelete = { text = '~' }, ---@diagnostic disable-line: missing-fields
     },
+    on_attach = function(bufnr)
+      local gitsigns = require 'gitsigns'
+      local function map(mode, l, r, opts)
+        opts = opts or {}
+        opts.buffer = bufnr
+        vim.keymap.set(mode, l, r, opts)
+      end
+
+      -- Jump between changed hunks
+      map('n', ']c', function() gitsigns.nav_hunk 'next' end, { desc = 'Next git [c]hange' })
+      map('n', '[c', function() gitsigns.nav_hunk 'prev' end, { desc = 'Prev git [c]hange' })
+
+      -- See what a line used to be (popup over the current hunk)
+      map('n', '<leader>hp', gitsigns.preview_hunk, { desc = 'git [p]review hunk' })
+      map('n', '<leader>hi', gitsigns.preview_hunk_inline, { desc = 'git preview hunk [i]nline' })
+      map('n', '<leader>hb', function() gitsigns.blame_line { full = true } end, { desc = 'git [b]lame line' })
+      map('n', '<leader>hd', gitsigns.diffthis, { desc = 'git [d]iff against index' })
+
+      -- Stage / undo changes
+      map('n', '<leader>hs', gitsigns.stage_hunk, { desc = 'git [s]tage hunk' })
+      map('n', '<leader>hr', gitsigns.reset_hunk, { desc = 'git [r]eset hunk' })
+      map('v', '<leader>hs', function() gitsigns.stage_hunk { vim.fn.line '.', vim.fn.line 'v' } end, { desc = 'git [s]tage hunk' })
+      map('v', '<leader>hr', function() gitsigns.reset_hunk { vim.fn.line '.', vim.fn.line 'v' } end, { desc = 'git [r]eset hunk' })
+
+      -- Toggle persistent inline blame (VSCode-style)
+      map('n', '<leader>tb', gitsigns.toggle_current_line_blame, { desc = '[T]oggle git [b]lame line' })
+    end,
   }
 
   -- Useful plugin to show you pending keybinds.

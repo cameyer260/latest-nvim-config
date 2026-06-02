@@ -83,6 +83,8 @@ It's picked up automatically on next launch.
 - Added **prettierd** to Mason + wired up `conform` formatters per filetype
 - Expanded the **treesitter** parser list
 - Telescope `find_files`/`live_grep` now include **hidden files** (skip `.git`)
+- Added **gitsigns** keymaps (`on_attach`) to the `init.lua` setup — gutter signs were
+  already on; this adds hunk preview/navigation/staging (see keybinding reference)
 - Enabled `require 'custom.plugins'` to load my extra files
 
 ## 5. Language servers (auto-installed by Mason)
@@ -162,6 +164,22 @@ Formatting via `conform` (`<leader>f`): `prettierd` for the web stack, `ruff` fo
 |-----|--------|
 | `:%s/old/new/g` | Replace in current file (live-previewed; add `c` flag to confirm each) |
 | `<leader>R` | **Project-wide** find & replace panel (grug-far) |
+
+### Git changes (gitsigns)
+The gutter marks edited lines vs. the last commit: `+` added · `~` modified · `_`/`‾` deleted.
+
+| Key | Action |
+|-----|--------|
+| `<leader>hp` | **Preview hunk** — popup showing what the line(s) used to be |
+| `<leader>hi` | Preview hunk **inline** (old text shown in-buffer, diff-colored) |
+| `<leader>hb` | Git **blame** the current line (who/when/why) |
+| `<leader>hd` | **Diff** the file against the index |
+| `]c` / `[c` | Jump to next / previous change |
+| `<leader>hs` / `<leader>hr` | **Stage** / **reset** the hunk (also works on a visual selection) |
+| `<leader>tb` | Toggle persistent inline blame (VSCode-style) |
+
+> These are buffer-local — they only attach inside a git repo. Press `<leader>h` and wait
+> for the **which-key** "Git Hunk" menu.
 
 ### LSP (active when a language server attaches)
 | Key | Action |
