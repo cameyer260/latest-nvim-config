@@ -68,7 +68,8 @@ Restart `nvim` once it's done. Useful health/status commands:
         ├── tree.lua              # neo-tree file explorer (shows hidden files)
         ├── tabs.lua              # bufferline (Chrome-style tabs)
         ├── terminal.lua          # toggleterm (floating terminal)
-        └── findreplace.lua       # grug-far (project-wide find & replace)
+        ├── findreplace.lua       # grug-far (project-wide find & replace)
+        └── csvview.lua           # spreadsheet-style CSV/TSV display
 ```
 
 **To add a plugin:** drop a new `lua/custom/plugins/whatever.lua` that calls
@@ -86,6 +87,8 @@ It's picked up automatically on next launch.
 - Added **gitsigns** keymaps (`on_attach`) to the `init.lua` setup — gutter signs were
   already on; this adds hunk preview/navigation/staging (see keybinding reference)
 - Enabled `require 'custom.plugins'` to load my extra files
+- Added **csvview.nvim** for an automatic, bordered table view of CSV and TSV files,
+  including sticky headers and spreadsheet-style navigation
 
 ## 5. Language servers (auto-installed by Mason)
 

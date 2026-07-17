@@ -40,6 +40,18 @@ Inside the file explorer: `a` add file (end the name with `/` for a folder), `A`
 folder, `d` delete, `r` rename, `m` move, `c` copy, `x` cut, `p` paste, `H` toggle
 hidden-file filtering, `R` refresh, and `?` shows all explorer mappings.
 
+## CSV and TSV tables
+
+CSV and TSV files automatically open in a bordered, spreadsheet-style table view with
+a sticky header. The original file contents remain unchanged.
+
+| Key / command | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Move to the next / previous field. |
+| `Enter` / `Shift+Enter` | Move to the next / previous row. |
+| `:CsvViewToggle` | Toggle the table display for the current buffer. |
+| `:CsvViewEnable` / `:CsvViewDisable` | Explicitly show / hide the table display. |
+
 ## Search and replace
 
 | Key / command | Action |
