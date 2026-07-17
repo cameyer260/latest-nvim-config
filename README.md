@@ -122,6 +122,11 @@ Read through the `init.lua` file in your configuration folder for more
 information about extending and exploring Neovim. That also includes
 examples of adding popularly requested plugins.
 
+#### Quick Reference
+
+See [KEYBINDINGS.md](KEYBINDINGS.md) for the configured keybindings and useful
+Neovim commands.
+
 > [!NOTE]
 > For more information about a particular plugin check its repository's documentation.
 
