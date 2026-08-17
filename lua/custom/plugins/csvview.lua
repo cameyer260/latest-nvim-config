@@ -15,6 +15,25 @@ require('csvview').setup {
   },
 }
 
+-- Sticky header mirrors the gutter via nvim_eval_statusline({ use_statuscol_lnum = vim.v.lnum }).
+-- Neovim rejects lnum < 1 (and past EOF). During float open/close/scroll races, statuscolumn
+-- can run with vim.v.lnum == 0 and error. Skip those frames; keep sticky headers enabled.
+local sticky_header = require 'csvview.sticky_header'
+local eval_statuscolumn = sticky_header.statuscolumn
+function sticky_header.statuscolumn(winid)
+  local lnum = vim.v.lnum
+  if type(lnum) ~= 'number' or lnum < 1 then
+    return ''
+  end
+  if vim.api.nvim_win_is_valid(winid) then
+    local bufnr = vim.api.nvim_win_get_buf(winid)
+    if lnum > vim.api.nvim_buf_line_count(bufnr) then
+      return ''
+    end
+  end
+  return eval_statuscolumn(winid)
+end
+
 vim.api.nvim_create_autocmd('FileType', {
   pattern = { 'csv', 'tsv' },
   callback = function()
