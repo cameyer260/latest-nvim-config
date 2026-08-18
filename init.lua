@@ -726,6 +726,8 @@ do
     ruff = {}, -- Python linting + formatting (fast)
     bashls = {}, -- Bash / shell
     marksman = {}, -- Markdown
+    ruby_lsp = {}, -- Ruby
+    rubocop = {}, -- Ruby linting/formatting (uses project .rubocop.yml)
 
     stylua = {}, -- Used to format Lua code
 
@@ -941,7 +943,7 @@ do
   -- Ensure parsers are installed for the languages we work in (syntax + indent)
   local parsers = {
     'bash', 'c', 'cpp', 'css', 'diff', 'html', 'javascript', 'json',
-    'lua', 'luadoc', 'markdown', 'markdown_inline', 'python', 'query', 'rust',
+    'lua', 'luadoc', 'markdown', 'markdown_inline', 'python', 'query', 'ruby', 'rust',
     'toml', 'tsx', 'typescript', 'vim', 'vimdoc', 'yaml', 'astro',
   }
   require('nvim-treesitter').install(parsers)
