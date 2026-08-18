@@ -99,7 +99,7 @@ do
   vim.g.maplocalleader = ' '
 
   -- Set to true if you have a Nerd Font installed and selected in the terminal
-  -- (Step 0 installs JetBrainsMono Nerd Font and sets it in Ghostty — see SETUP.md)
+  -- (see SETUP.md §1 for per-OS Nerd Font setup)
   vim.g.have_nerd_font = true
 
   -- [[ Setting options ]]
@@ -826,6 +826,7 @@ do
       lua = { 'stylua' },
       python = { 'ruff_format' },
       rust = { 'rustfmt' },
+      ruby = { 'rubocop' },
       -- prettierd handles the whole web stack; first available wins.
       javascript = { 'prettierd', 'prettier', stop_after_first = true },
       typescript = { 'prettierd', 'prettier', stop_after_first = true },
@@ -994,28 +995,11 @@ do
 end
 
 -- ============================================================
--- SECTION 9: OPTIONAL EXAMPLES / NEXT STEPS
--- kickstart.plugins.* examples
+-- SECTION 9: CUSTOM PLUGINS
+-- Loads every file in `lua/custom/plugins/` (colorscheme, tree, tabs, terminal, find-replace, ...).
+-- To add your own plugin, drop a new file in that directory.
 -- ============================================================
 do
-  -- The following comments only work if you have downloaded the kickstart repo, not just copy pasted the
-  -- init.lua. If you want these files, they are in the repository, so you can just download them and
-  -- place them in the correct locations.
-
-  -- NOTE: Next step on your Neovim journey: Add/Configure additional plugins for Kickstart
-  --
-  --  Here are some example plugins that I've included in the Kickstart repository.
-  --  Uncomment any of the lines below to enable them (you will need to restart nvim).
-  --
-  -- require 'kickstart.plugins.debug'
-  -- require 'kickstart.plugins.indent_line'
-  -- require 'kickstart.plugins.lint'
-  -- require 'kickstart.plugins.autopairs'
-  -- require 'kickstart.plugins.neo-tree'
-  -- require 'kickstart.plugins.gitsigns' -- adds gitsigns recommended keymaps
-
-  -- NOTE: You can add your own plugins, configuration, etc from `lua/custom/plugins/*.lua`
-  --  This loads every file in `lua/custom/plugins/` (colorscheme, tree, tabs, terminal, find-replace).
   require 'custom.plugins'
 end
 

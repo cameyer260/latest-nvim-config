@@ -114,7 +114,8 @@ These are available in files inside a Git repository. The gutter uses `+` for ad
 | `gc` (Visual) / `gcc` | Toggle comment for selection / line. |
 | `saiw)` / `sd'` / `sr)'` | Add / delete / replace surrounding delimiters. |
 
-The system clipboard is enabled, so normal `y` and `p` use the macOS clipboard.
+The system clipboard is enabled, so normal `y` and `p` use the system clipboard
+(needs a clipboard provider on Linux — `xclip`/`xsel`/`wl-copy`; irrelevant headless).
 
 ## Completion and snippets (Insert mode)
 

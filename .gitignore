@@ -1,10 +1,14 @@
+# Local / generated artifacts
 tags
-test.sh
-.luarc.json
-nvim
-
 spell/
+.luarc.json
 
-# Lockfile is tracked in this fork so plugin versions are reproducible.
+# Tool caches
+.ruby-lsp/
+.pi/
 
+# OS
 .DS_Store
+
+# NOTE: nvim-pack-lock.json is intentionally tracked so plugin versions
+# are reproducible (see `:help vim.pack-lockfile`).

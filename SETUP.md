@@ -1,42 +1,99 @@
 # My Neovim setup
 
 A lean, self-owned config built on **kickstart.nvim**. The goal: a real IDE in the
-terminal (Ghostty), staying on the keyboard, with only the plugins I actually use —
-and every line readable/editable by me.
+terminal, staying on the keyboard, with only the plugins I actually use — and every
+line readable/editable by me.
 
 - **Base:** kickstart.nvim (the heavily-commented `init.lua`)
 - **Plugin manager:** `vim.pack` — Neovim's *built-in* manager. No lazy.nvim. Plugins
   are declared with `vim.pack.add { 'https://github.com/owner/repo' }` and bootstrap on
   first launch.
 - **Theme:** Kanagawa (hardcoded, `kanagawa-wave`)
-- **Runs:** natively on macOS inside Ghostty.
 
 ---
 
-## 1. Prerequisites (one-time, on the Mac)
+## 1. Prerequisites
 
-Neovim **0.12+** is required (that's where `vim.pack` lives — current `stable` is fine).
+Neovim **0.12+** is required (that's where `vim.pack` lives). Check with
+`nvim --version`. Distro/package-manager versions are often older than that — see
+the notes below.
+
+### Core dependencies (every OS)
+
+| Tool | Why |
+|---|---|
+| `git` | `vim.pack` clones plugins with it |
+| `make` + C compiler (`gcc`/`clang`) | builds `telescope-fzf-native` and compiles treesitter parsers |
+| `unzip` | Mason unpacks packages |
+| `ripgrep` (`rg`) | Telescope file finding + live grep |
+| Node.js 18+ (`node`) | runtime for most language servers — see §5 |
+
+Notes:
+
+- `fd` and `fzf` are **not** needed — Telescope is configured to use `rg` directly.
+- `tree-sitter-cli` is optional: parser *installs* compile with your C compiler; the
+  CLI is only needed to develop/generate parsers from grammars.
+- Language toolchains (Ruby, Rust, C++, Python) are only needed if you work in those
+  languages — see §5 for which server needs what on the host.
+
+### macOS (Homebrew)
 
 ```bash
-# Core
-brew install neovim ripgrep fd fzf git
-brew install tree-sitter-cli # CLI used to compile treesitter parsers (REQUIRED by the main branch).
-                             # NOTE: the `tree-sitter` formula is only the library now — you need `tree-sitter-cli`.
-brew install node            # runtime for the web / JSON / YAML language servers
-brew install --cask font-jetbrains-mono-nerd-font   # icons for the tree + tabs
+xcode-select --install          # make + clang (fzf-native build, treesitter parsers)
+brew install neovim git ripgrep node
+brew install ruby               # for ruby_lsp / rubocop (system ruby is too old/locked down)
 
-# For the compiled-language servers (C/C++/Rust):
-xcode-select --install                       # clang/clangd toolchain (skip if already installed)
-brew install rustup-init && rustup-init -y   # gives rust_analyzer a real toolchain
+# Optional, per language:
+brew install rustup-init && rustup-init -y   # Rust toolchain (rust_analyzer needs it)
+brew install python                          # so pyright can resolve your envs
+brew install --cask font-jetbrains-mono-nerd-font   # Nerd Font (see below)
 ```
 
-Then point Ghostty at the Nerd Font — add to `~/.config/ghostty/config`:
+Then point your terminal at the Nerd Font — for Ghostty, in `~/.config/ghostty/config`:
 
 ```
 font-family = JetBrainsMono Nerd Font
 ```
 
-Check the version: `nvim --version` → should report **v0.12** or newer.
+### Ubuntu / Debian
+
+Distro Neovim is usually too old for `vim.pack`; use the stable PPA (or the release
+tarball from neovim/neovim if you can't add PPAs):
+
+```bash
+sudo add-apt-repository ppa:neovim-ppa/stable -y
+sudo apt update
+sudo apt install neovim git make gcc unzip ripgrep nodejs npm
+sudo apt install ruby-full        # for ruby_lsp / rubocop
+
+# Optional: Rust toolchain (apt's rustc is often too old for rust_analyzer)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Check `node --version` — on older releases (e.g. 22.04) apt ships Node 12, which is
+too old for most language servers; use [NodeSource](https://github.com/nodesource/distributions)
+or `nvm` in that case.
+
+### Other Linux
+
+Same package set as Ubuntu: `neovim git make gcc unzip ripgrep nodejs ruby`
+(via `dnf`, `pacman`, etc.). On Arch, `ripgrep`/`fd`-style naming quirks don't apply
+here since only `rg` is used.
+
+### Windows
+
+Least-tested path — WSL with the Ubuntu steps above works best. Native option:
+`choco install neovim git ripgrep unzip make mingw nodejs ruby`.
+
+### Nerd Font (optional but recommended)
+
+Icons in the tree/tabs come from a Nerd Font, and it only matters on the machine
+**where your terminal runs** — a headless VPS needs nothing here. macOS: the brew
+cask above. Linux desktop: install any Nerd Font (nerdfonts.com → `~/.local/share/fonts`)
+and select it in your terminal emulator. The config assumes one
+(`vim.g.have_nerd_font = true` in `init.lua`); set it `false` if you don't have one.
+
+Verify everything: `nvim --version` (≥ 0.12), then inside nvim run `:checkhealth`.
 
 ## 2. First launch
 
@@ -58,10 +115,14 @@ Restart `nvim` once it's done. Useful health/status commands:
 
 ```
 ~/.config/nvim/
-├── init.lua                      # kickstart core, lightly edited (see "What I changed")
+├── init.lua                      # kickstart core, edited (see "What I changed")
+├── README.md                     # overview + install
 ├── SETUP.md                      # this file
+├── KEYBINDINGS.md                # shortcut & command reference
+├── nvim-pack-lock.json           # pinned plugin versions (tracked on purpose)
 └── lua/
-    ├── kickstart/                # kickstart's own modules (mostly untouched)
+    ├── kickstart/
+    │   └── health.lua            # powers `:checkhealth` for this config
     └── custom/plugins/           # my additions — each file auto-loaded by init.lua
         ├── init.lua              # loader: requires every other file in this dir
         ├── colorscheme.lua       # Kanagawa
@@ -80,7 +141,7 @@ It's picked up automatically on next launch.
 
 - `vim.g.have_nerd_font = true`
 - Replaced tokyonight with **Kanagawa** (`custom/plugins/colorscheme.lua`)
-- Filled in the **LSP `servers`** table with my languages (see below)
+- Filled in the **LSP `servers`** table with my languages (see §5)
 - Added **prettierd** to Mason + wired up `conform` formatters per filetype
 - Expanded the **treesitter** parser list
 - Telescope `find_files`/`live_grep` now include **hidden files** (skip `.git`)
@@ -90,26 +151,33 @@ It's picked up automatically on next launch.
 - Added **csvview.nvim** for an automatic, bordered table view of CSV and TSV files,
   including sticky headers and spreadsheet-style navigation
 
-## 5. Language servers (auto-installed by Mason)
+## 5. Language servers & host dependencies
 
-| Language(s)            | Server(s)                          |
-|------------------------|------------------------------------|
-| JS / TS / JSX / TSX    | `ts_ls`, `eslint`                  |
-| HTML + Emmet           | `html`, `emmet_language_server`    |
-| CSS / SCSS             | `cssls`                            |
-| Tailwind               | `tailwindcss`                      |
-| Astro                  | `astro`                            |
-| JSON                   | `jsonls`                           |
-| YAML                   | `yamlls`                           |
-| Python                 | `pyright`, `ruff`                  |
-| Rust                   | `rust_analyzer`                    |
-| C / C++                | `clangd`                           |
-| Bash                   | `bashls`                           |
-| Markdown               | `marksman`                         |
-| Lua (this config)      | `lua_ls`                           |
+Mason downloads each server itself on first launch — but a server is often just a
+wrapper around tooling that must exist **on the host, in `$PATH`**. Without the host
+dependency the server installs fine but won't start (check `:checkhealth` / `:Mason`).
+
+| Language(s)            | Server(s)                          | Host requirement |
+|------------------------|------------------------------------|------------------|
+| JS / TS / JSX / TSX    | `ts_ls`, `eslint`                  | Node 18+ (`eslint` also wants eslint in the project: `npm i -D eslint`) |
+| HTML + Emmet           | `html`, `emmet_language_server`    | Node |
+| CSS / SCSS             | `cssls`                            | Node |
+| Tailwind               | `tailwindcss`                      | Node |
+| Astro                  | `astro`                            | Node |
+| JSON                   | `jsonls`                           | Node |
+| YAML                   | `yamlls`                           | Node |
+| Python                 | `pyright`, `ruff`                  | Node (pyright is written in TS); `ruff` is standalone; `python3` recommended so pyright resolves your env |
+| Rust                   | `rust_analyzer`                    | Rust toolchain (`rustup`) — server binary is standalone, but needs `cargo`/`rustc` to be useful |
+| C / C++                | `clangd`                           | None (standalone binary); a compiler + `compile_commands.json` in the project makes it useful |
+| Ruby                   | `ruby_lsp`, `rubocop`              | **Ruby 3.0+ with `gem`** — Mason installs the servers as gems into its own dir, but runs them with your host ruby |
+| Bash                   | `bashls`                           | Node |
+| Markdown               | `marksman`                         | None (standalone) |
+| Lua (this config)      | `lua_ls`                           | None (standalone) |
+
+Extra Mason tools: `prettierd` (needs Node) and `stylua` (standalone).
 
 Formatting via `conform` (`<leader>f`): `prettierd` for the web stack, `ruff` for Python,
-`rustfmt` for Rust, `stylua` for Lua. LSP formatting is the fallback.
+`rustfmt` for Rust, `rubocop` for Ruby, `stylua` for Lua. LSP formatting is the fallback.
 
 ---
 
@@ -121,33 +189,27 @@ See [KEYBINDINGS.md](KEYBINDINGS.md) for the consolidated shortcut and command r
 
 ## 7. Notes & gotchas
 
-- **Cmd keys don't reach Neovim** in a terminal (Ghostty owns `Cmd`), which is why tab
-  navigation uses `Shift+H/L` and leader chords instead of `Cmd+T`/`Cmd+W`. To revisit this
-  later you'd configure Ghostty `keybind` entries to forward escape sequences — not done here.
-- `rust_analyzer` and `clangd` need their toolchains (step 1) to be fully useful. The
-  web/JSON/YAML servers just need `node`.
-- If icons look like boxes, the Nerd Font isn't active in Ghostty — recheck step 1.
-- This is a git repo (`git init` was run, kickstart's history removed). Commit it so it's
-  yours: `cd ~/.config/nvim && git add -A && git commit -m "initial setup"`.
-- Run `:Tutor` once if you want a Neovim motions refresher.
+- **Clipboard:** the config sets `clipboard = unnamedplus`. On a desktop that needs a
+  provider (`pbcopy` on macOS, `xclip`/`xsel` on X11, `wl-copy` on Wayland,
+  `win32yank` on Windows). On a headless server there's nothing to copy to — Neovim
+  just falls back, which is fine; yank/paste inside nvim still works.
 
 ---
 
 ## 8. Dump LSP diagnostics for an AI to fix
 
-The orange underlines and `W`/`E` markers in the gutter are LSP **diagnostics** (warnings/
-errors about the *code*) — not git changes and not "unsaved edits". When they pile up, you can
-export them all to a plain file and hand it to an AI agent ("read this file and fix every
-issue"). They're the merged output of every attached server (`ts_ls`, `tailwindcss`, `astro`,
-`eslint`, …); there's no single CLI that reproduces them (notably, tailwind's class warnings
-**only** exist in the language server), so the trick is to let Neovim itself produce them.
+LSP **diagnostics** (errors/warnings about your code) only exist for *open* files,
+since language servers attach per buffer. The script below grabs them for the whole
+repo at once: it opens every tracked file headlessly, waits for the servers to
+attach, and produces a plain-text dump of every diagnostic — hand that to your AI
+harness and have it address the issues.
 
 ### The `nvim-diag` script
 
-Launches Neovim headlessly with *this* config, opens the files so every server attaches, waits
-for them to report, collects the diagnostics, and copies them to the clipboard (via `pbcopy`) —
-then you just paste into the AI. Nothing is left on disk: it routes through a temp file that's
-deleted on exit. Save as `~/.local/bin/nvim-diag` and `chmod +x` it:
+The output is copied to the clipboard (whatever the platform provides; prints to
+stdout if none), so you can just paste it into the harness. Nothing is left on
+disk: it routes through a temp file that's deleted on exit. Save as
+`~/.local/bin/nvim-diag` and `chmod +x` it:
 
 ```bash
 #!/usr/bin/env bash
@@ -156,15 +218,15 @@ deleted on exit. Save as `~/.local/bin/nvim-diag` and `chmod +x` it:
 #   nvim-diag src/**/*.astro   # just these files/globs
 set -euo pipefail
 
-# macOS defaults to a 256 open-file limit; opening a whole repo + spawning the
-# language servers blows past it (EMFILE). Raise it as high as the shell allows.
+# Opening a whole repo + spawning language servers can exceed the default
+# open-file limit (EMFILE). Raise it as high as the shell allows.
 for n in 10240 8192 4096 2048; do ulimit -n "$n" 2>/dev/null && break; done
 
 if [[ $# -gt 0 ]]; then
   files=("$@")
 else
   files=()
-  while IFS= read -r f; do files+=("$f"); done < <(git ls-files)   # macOS Bash 3.2 has no `mapfile`
+  while IFS= read -r f; do files+=("$f"); done < <(git ls-files)   # portable: no `mapfile` (macOS ships Bash 3.2)
 fi
 [[ ${#files[@]} -eq 0 ]] && { echo "no files to scan"; exit 1; }
 
@@ -180,7 +242,21 @@ nvim --headless -n "${files[@]}" \
   -c 'qa!' || true   # nvim may exit nonzero on LSP noise; we still want the output
 
 [[ -f "$NVIM_DIAG_OUT" ]] || { echo "no output produced"; exit 1; }
-pbcopy < "$NVIM_DIAG_OUT"   # macOS clipboard; swap for wl-copy/xclip on Linux
+
+# Copy with whatever clipboard tool the platform provides; print if none.
+if command -v pbcopy >/dev/null 2>&1; then
+  pbcopy < "$NVIM_DIAG_OUT"
+elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+  wl-copy < "$NVIM_DIAG_OUT"
+elif [[ -n "${DISPLAY:-}" ]] && command -v xclip >/dev/null 2>&1; then
+  xclip -selection clipboard < "$NVIM_DIAG_OUT"
+elif command -v clip.exe >/dev/null 2>&1; then
+  clip.exe < "$NVIM_DIAG_OUT"   # WSL
+else
+  cat "$NVIM_DIAG_OUT"
+  echo "$(grep -c . "$NVIM_DIAG_OUT") diagnostics printed above (no clipboard tool found)"
+  exit 0
+fi
 echo "$(grep -c . "$NVIM_DIAG_OUT") diagnostics copied to clipboard"
 ```
 
@@ -201,4 +277,3 @@ src/lib/util.ts:9:7: [ERROR] 'foo' is declared but never used (typescript)
   `git ls-files` covers the repo; a single arg gives just that file.
 - `d.severity<=WARN` keeps errors + warnings; remove that check to include hints/info.
 - First run in a new project pauses while Mason's servers attach — that's the `vim.wait`.
-- `pbcopy` is macOS-only; on Linux swap it for `wl-copy` (Wayland) or `xclip -selection clipboard`.
