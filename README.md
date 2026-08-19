@@ -1,11 +1,7 @@
 # Neovim config
 
-My personal Neovim configuration, built on [kickstart.nvim](https://github.com/nvim-lua/kickstart.nvim):
-a lean, IDE-style setup using Neovim's built-in plugin manager (`vim.pack`) with
-all language servers auto-installed by Mason.
-
-It's public because I sync it across machines (macOS laptop, Ubuntu VPS) — it is a
-personal config, not a distribution. If you want to use it, fork it.
+My personal Neovim configuration, built on [kickstart.nvim](https://github.com/nvim-lua/kickstart.nvim).
+Uses Neovim's built-in plugin manager (`vim.pack`) with all language servers auto-installed by Mason.
 
 ## Highlights
 
