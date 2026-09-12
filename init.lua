@@ -502,18 +502,29 @@ do
   -- See `:help telescope` and `:help telescope.setup()`
   require('telescope').setup {
     defaults = {
-      -- ripgrep args used by live_grep / grep_string. `--hidden` includes dotfiles;
-      -- we still skip the .git dir so it isn't full of object noise.
+      -- ripgrep args used by live_grep / grep_string. `--hidden` includes dotfiles,
+      -- `--no-ignore` includes gitignored files; we manually exclude .git + build artifacts.
       vimgrep_arguments = {
         'rg', '--color=never', '--no-heading', '--with-filename', '--line-number',
-        '--column', '--smart-case', '--hidden', '--glob', '!**/.git/*',
+        '--column', '--smart-case', '--hidden', '--no-ignore',
+        '--glob', '!**/.git/*',
+        '--glob', '!**/node_modules/*',
+        '--glob', '!**/dist/*',
+        '--glob', '!**/.next/*',
+        '--glob', '!**/build/*',
       },
     },
     pickers = {
-      -- Include hidden files (e.g. .env) in the file finder; still skip .git.
+      -- Include hidden + gitignored files (e.g. .env); only skip .git + build artifacts.
       find_files = {
         hidden = true,
-        find_command = { 'rg', '--files', '--hidden', '--glob', '!**/.git/*' },
+        find_command = { 'rg', '--files', '--hidden', '--no-ignore',
+          '--glob', '!**/.git/*',
+          '--glob', '!**/node_modules/*',
+          '--glob', '!**/dist/*',
+          '--glob', '!**/.next/*',
+          '--glob', '!**/build/*',
+        },
       },
     },
     extensions = {
