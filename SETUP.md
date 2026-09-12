@@ -144,7 +144,7 @@ It's picked up automatically on next launch.
 - Filled in the **LSP `servers`** table with my languages (see §5)
 - Added **prettierd** to Mason + wired up `conform` formatters per filetype
 - Expanded the **treesitter** parser list
-- Telescope `find_files`/`live_grep` now include **hidden files** (skip `.git`)
+- Telescope `find_files`/`live_grep` now include **hidden + gitignored files** (only skips `.git`, `node_modules`, `dist`, `.next`, `build`)
 - Added **gitsigns** keymaps (`on_attach`) to the `init.lua` setup — gutter signs were
   already on; this adds hunk preview/navigation/staging (see keybinding reference)
 - Enabled `require 'custom.plugins'` to load my extra files

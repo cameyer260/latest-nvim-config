@@ -23,7 +23,7 @@ Notation: `<leader>` = `Space`; `Ctrl` means hold Control; `Shift+K` means upper
 |---|---|
 | `<leader>e` | Toggle the file explorer; reveal the current file. |
 | `<leader>o` | Focus the file explorer. |
-| `<leader>sf` | Find files, including hidden files. |
+| `<leader>sf` | Find files, including hidden + gitignored files. |
 | `<leader>sn` | Find files in this Neovim configuration. |
 | `<leader>s.` | Search recently opened files. |
 | `:e path/to/file` | Open a file (Tab completes paths). |
@@ -56,7 +56,7 @@ a sticky header. The original file contents remain unchanged.
 
 | Key / command | Action |
 |---|---|
-| `<leader>sg` | Live grep in the project, including hidden files. |
+| `<leader>sg` | Live grep in the project, including hidden + gitignored files. |
 | `<leader>sw` | Search the word under the cursor or the visual selection. |
 | `<leader>s/` | Live grep only in open files. |
 | `<leader>/` | Fuzzy-search the current file. |
