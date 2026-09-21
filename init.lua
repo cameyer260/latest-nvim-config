@@ -986,6 +986,10 @@ do
     callback = function(args)
       local buf, filetype = args.buf, args.match
 
+      -- csvview.nvim provides per-column colors via legacy csvCol syntax;
+      -- treesitter csv/tsv paints everything @string and breaks it.
+      if filetype == 'csv' or filetype == 'tsv' then return end
+
       local language = vim.treesitter.language.get_lang(filetype)
       if not language then return end
 
