@@ -119,10 +119,11 @@ do
   -- Don't show the mode, since it's already in the status line
   vim.o.showmode = false
 
-  -- Sync clipboard between OS and Neovim.
-  --  Schedule the setting after `UiEnter` because it can increase startup-time.
-  --  Remove this option if you want your OS clipboard to remain independent.
-  --  See `:help 'clipboard'`
+  -- Copy to the attached terminal with OSC 52; paste from a local cache.
+  -- Herdr cannot answer OSC 52 reads. Use the terminal's Cmd+V for Mac text.
+  require('custom.clipboard').setup()
+
+  -- Make normal y/p use the copy-only provider without terminal read timeouts.
   vim.schedule(function() vim.o.clipboard = 'unnamedplus' end)
 
   -- Enable break indent

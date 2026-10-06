@@ -42,6 +42,11 @@
       "rev": "bb85e4bfc8d89b0e62c8fa53ccdd13d12e2f77b3",
       "src": "https://github.com/rebelot/kanagawa.nvim"
     },
+    "markdown-table-wrap.nvim": {
+      "rev": "02445d4c338fa0966f997d45b134d197b4605f5a",
+      "src": "https://github.com/ice345/markdown-table-wrap.nvim",
+      "version": "'v0.9.0'"
+    },
     "mason-lspconfig.nvim": {
       "rev": "7b01e2974a47d489bb92f47a41e4c0088ea8f86e",
       "src": "https://github.com/mason-org/mason-lspconfig.nvim"

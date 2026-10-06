@@ -119,7 +119,8 @@ Restart `nvim` once it's done. Useful health/status commands:
 ├── README.md                     # overview + install
 ├── SETUP.md                      # this file
 ├── KEYBINDINGS.md                # shortcut & command reference
-├── nvim-pack-lock.json           # pinned plugin versions (tracked on purpose)
+├── nvim-pack-lock.json           # pinned downloaded plugin versions
+├── vendor/markdown-table-wrap.nvim/ # local Reader fork; see its README.md
 └── lua/
     ├── kickstart/
     │   └── health.lua            # powers `:checkhealth` for this config
@@ -130,6 +131,7 @@ Restart `nvim` once it's done. Useful health/status commands:
         ├── tabs.lua              # bufferline (Chrome-style tabs)
         ├── terminal.lua          # toggleterm (floating terminal)
         ├── findreplace.lua       # grug-far (project-wide find & replace)
+        ├── markdown.lua          # wrapped-table Reader + Markdown prose styling
         └── csvview.lua           # spreadsheet-style CSV/TSV display
 ```
 
@@ -150,6 +152,26 @@ It's picked up automatically on next launch.
 - Enabled `require 'custom.plugins'` to load my extra files
 - Added **csvview.nvim** for an automatic, bordered table view of CSV and TSV files,
   including sticky headers and spreadsheet-style navigation
+- Added a **local markdown-table-wrap.nvim fork**, based on `v0.9.0`, for automatic
+  Reader mode: tables fit the window and wrap within cells, native word motions
+  navigate displayed text, and edit/save commands operate on the original Markdown
+  Source. `<leader>mr` toggles Reader/Source; `<leader>me` edits Source without
+  overriding native `e`. The fork caches recent window layouts/highlight chunks and
+  avoids per-character metadata reconstruction and no-op resize rebuilds.
+- Kept **render-markdown.nvim** for prose styling, with its table rendering disabled
+  to avoid conflicting overlays; removed the old forced-nowrap/hidden-cursor-line setup
+
+### Local Markdown Reader maintenance
+
+The Reader lives in `vendor/markdown-table-wrap.nvim/` and loads directly from this
+configuration, not from `vim.pack`'s downloaded packages. Keep the vendor directory
+with the config in Git. `vim.pack.update()` cannot overwrite it; upstream upgrades
+must be merged deliberately. Its `README.md` records the base commit, modified
+files and regression commands. Restart Neovim after changing the fork.
+
+Run the configured file-tree/close integration tests from `~/.config/nvim/` with
+`python3 tests/markdown_reader_integration.py` (requires `pynvim`). These use a fresh
+Neovim process and disposable fixtures, not your open notes.
 
 ## 5. Language servers & host dependencies
 
@@ -189,10 +211,13 @@ See [KEYBINDINGS.md](KEYBINDINGS.md) for the consolidated shortcut and command r
 
 ## 7. Notes & gotchas
 
-- **Clipboard:** the config sets `clipboard = unnamedplus`. On a desktop that needs a
-  provider (`pbcopy` on macOS, `xclip`/`xsel` on X11, `wl-copy` on Wayland,
-  `win32yank` on Windows). On a headless server there's nothing to copy to — Neovim
-  just falls back, which is fine; yank/paste inside nvim still works.
+- **Clipboard:** `clipboard = unnamedplus` uses the provider in
+  `lua/custom/clipboard.lua`. Copies go to the attached terminal via OSC 52;
+  pastes use a per-process local cache, preserving characterwise/linewise/blockwise
+  register types. Both `+` and `*` target the standard clipboard Herdr forwards.
+  This avoids Herdr's unsupported OSC 52 reads and their 10-second timeout.
+  To paste new text from another Mac app, use Insert mode + `Cmd+V`; `p`/`P`
+  only sees text copied/cut in this Neovim instance. No `xclip`/`xsel` is needed.
 
 ---
 

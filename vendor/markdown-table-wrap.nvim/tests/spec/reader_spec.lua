@@ -1,0 +1,649 @@
+local h = require("tests.helpers")
+
+h.test("reader is the default preview mode", function()
+  local plugin = require("markdown-table-wrap")
+  plugin.setup({ auto_preview = false })
+  h.assert_eq("default preview mode", plugin.config.preview_mode, "reader")
+end)
+
+h.test("cursor-local Reader access avoids copying the complete state", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  plugin.setup({ auto_preview = false, preview_mode = "reader", min_col_width = 4, max_col_width = 12 })
+
+  h.with_buffer({
+    "| Name | Link |",
+    "| --- | --- |",
+    "| one | [GitHub](https://github.com) |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    local reader_bufnr = plugin.reader_preview()
+    local state = reader.get_state(reader_bufnr)
+    local target
+    for row, line_object in ipairs(state.line_objects or {}) do
+      for _, cell in ipairs(type(line_object) == "table" and line_object.cells or {}) do
+        if cell.row_index == 1 and cell.column_index == 2 then
+          target = { row = row, col = cell.start_col }
+          break
+        end
+      end
+      if target then
+        break
+      end
+    end
+    h.assert_true("Reader link cell is indexed", target ~= nil)
+    vim.api.nvim_win_set_cursor(0, { target.row, target.col })
+    local cell = reader.cell_at_cursor(reader_bufnr)
+
+    local summary = reader.summary(reader_bufnr)
+    h.assert_eq("Reader summary reports line count", summary.rendered_lines, vim.api.nvim_buf_line_count(reader_bufnr))
+    local line_object = reader.line_object(reader_bufnr, target.row)
+    local original_line_text = line_object.text
+    line_object.text = "mutated snapshot"
+    h.assert_eq(
+      "line snapshot cannot mutate Reader state",
+      reader.line_object(reader_bufnr, target.row).text,
+      original_line_text
+    )
+
+    local segments = reader.cell_segments(reader_bufnr, cell)
+    h.assert_true("cell snapshot contains indexed segments", segments ~= nil and #segments > 0)
+    local original_start_col = segments[1].cell.start_col
+    segments[1].cell.start_col = -1
+    h.assert_eq(
+      "cell segment snapshot cannot mutate Reader state",
+      reader.cell_segments(reader_bufnr, cell)[1].cell.start_col,
+      original_start_col
+    )
+
+    local rendered = reader.rendered_table(reader_bufnr, cell.table_id)
+    local original_border = rendered.lines[1]
+    rendered.lines[1] = "mutated snapshot"
+    h.assert_eq(
+      "rendered table snapshot cannot mutate Reader state",
+      reader.rendered_table(reader_bufnr, cell.table_id).lines[1],
+      original_border
+    )
+
+    local original_get_state = reader.get_state
+    reader.get_state = function()
+      error("internal Reader action requested a complete state snapshot")
+    end
+    local ok, err = pcall(function()
+      local context = plugin.get_state(reader_bufnr)
+      h.assert_eq("Reader context uses the narrow summary", context.reader.rendered_lines, summary.rendered_lines)
+      h.assert_true(
+        "Reader link lookup uses one line object",
+        #require("markdown-table-wrap.links").targets(context) > 0
+      )
+      h.assert_true(
+        "rendered cell copy avoids full Reader state",
+        plugin.copy_rendered_cell({ clipboard = false, silent = true })
+      )
+      h.assert_true(
+        "rendered table copy avoids full Reader state",
+        plugin.copy_rendered_table({ clipboard = false, silent = true })
+      )
+    end)
+    reader.get_state = original_get_state
+    h.assert_true("cursor-local Reader paths do not call get_state: " .. tostring(err), ok)
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader replaces source tables without modifying Markdown", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+    max_width_ratio = 0.9,
+    min_col_width = 8,
+    max_col_width = 50,
+    fit_to_window = true,
+  })
+
+  local source_lines = {
+    "A normal Markdown paragraph stays in the reader and can use native wrap.",
+    "",
+    "| Article | Read now | Workflow | Later |",
+    "|---|---|---|---|",
+    "| [eBPF verifier](https://docs.kernel.org/bpf/verifier.html) | register calling convention | bpf() load, JIT/attach | Week 5 state/bounds/pruning/log |",
+    "",
+    "Paragraph after the table.",
+  }
+
+  h.with_buffer(source_lines, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.wo.wrap = true
+    vim.api.nvim_win_set_width(0, 80)
+
+    local reader_bufnr = plugin.reader_preview()
+    h.assert_true("reader buffer created", reader_bufnr ~= nil and reader_bufnr ~= source_bufnr)
+    h.assert_true("reader buffer active", reader.is_reader(reader_bufnr))
+    h.assert_eq("reader is current buffer", vim.api.nvim_get_current_buf(), reader_bufnr)
+    h.assert_false("reader is not modifiable", vim.bo[reader_bufnr].modifiable)
+    h.assert_true("reader keeps native prose wrap", vim.wo.wrap)
+
+    local visual_is_buffer_mapped = false
+    for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(reader_bufnr, "n")) do
+      if mapping.lhs == "V" or mapping.lhs == "v" or mapping.lhs == "<C-V>" then
+        visual_is_buffer_mapped = true
+      end
+    end
+    h.assert_false("Visual selection stays in the real reader buffer", visual_is_buffer_mapped)
+
+    local rendered_lines = vim.api.nvim_buf_get_lines(reader_bufnr, 0, -1, false)
+    local rendered_text = table.concat(rendered_lines, "\n")
+    h.assert_true("reader contains Unicode table", rendered_text:find("╭", 1, true) ~= nil)
+    h.assert_true("reader contains rendered link label", rendered_text:find("eBPF verifier", 1, true) ~= nil)
+    h.assert_false("reader omits raw link URL", rendered_text:find("https://docs.kernel.org", 1, true) ~= nil)
+
+    local table_top = nil
+    for index, line in ipairs(rendered_lines) do
+      if line:match("^╭") then
+        table_top = index
+        break
+      end
+    end
+    h.assert_true("reader table top exists", table_top ~= nil)
+    vim.api.nvim_win_set_cursor(0, { table_top, 0 })
+    vim.cmd("normal! Vjy")
+    h.assert_eq("Visual yank stays in reader", vim.api.nvim_get_current_buf(), reader_bufnr)
+    h.assert_true("Visual yank copies rendered lines", vim.fn.getreg('"'):find("╭", 1, true) ~= nil)
+
+    for index, line in ipairs(rendered_lines) do
+      if line:match("^[╭├╰│]") then
+        h.assert_true("reader table line fits window " .. index, vim.api.nvim_strwidth(line) <= 72)
+      end
+      if line:match("^│") then
+        local _, borders = line:gsub("│", "")
+        h.assert_eq("reader content line has only column borders " .. index, borders, 5)
+      end
+    end
+
+    h.assert_true(
+      "source Markdown is unchanged",
+      vim.deep_equal(vim.api.nvim_buf_get_lines(source_bufnr, 0, -1, false), source_lines)
+    )
+
+    h.assert_true("reader closes to source", plugin.close_reader())
+    h.assert_eq("source restored", vim.api.nvim_get_current_buf(), source_bufnr)
+    h.assert_true("source wrap restored", vim.wo.wrap)
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader table overlay prevents secondary Markdown parsing from shifting borders", function()
+  local plugin = require("markdown-table-wrap")
+
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+    fit_to_window = true,
+    min_col_width = 8,
+    max_col_width = 28,
+  })
+
+  local source_lines = {
+    "| Probe | Candidate | Section | Risk | Meaning |",
+    "|---|---|---|---|---|",
+    '| kprobe/kretprobe | `kprobe:<discovered_function>` | `SEC("kprobe/<function>")` / `SEC("kretprobe/<function>")`，通常是 `BPF_PROG_TYPE_KPROBE` | kernel function ABI、符号和版本 | 观察实现函数 entry/return；函数可能服务多个调用路径 |',
+  }
+
+  h.with_buffer(source_lines, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.api.nvim_win_set_width(0, 100)
+
+    local reader_bufnr = plugin.reader_preview()
+    local rendered_lines = vim.api.nvim_buf_get_lines(reader_bufnr, 0, -1, false)
+    local ns = vim.api.nvim_get_namespaces()["markdown-table-wrap-reader"]
+    local marks = vim.api.nvim_buf_get_extmarks(reader_bufnr, ns, 0, -1, { details = true })
+    local overlays = {}
+    local concealed_rows = {}
+    local underscore_chunks = 0
+
+    for _, mark in ipairs(marks) do
+      local row = mark[2]
+      local details = mark[4]
+      if details.conceal ~= nil then
+        concealed_rows[row] = true
+      end
+      if details.virt_text then
+        local parts = {}
+        for _, chunk in ipairs(details.virt_text) do
+          table.insert(parts, chunk[1])
+          if chunk[1]:find("_", 1, true) then
+            underscore_chunks = underscore_chunks + 1
+            h.assert_eq("underscore remains code-styled", chunk[2], "MarkdownTableWrapCode")
+          end
+        end
+        overlays[row] = table.concat(parts)
+        h.assert_eq("Reader overlay replaces Markdown syntax", details.hl_mode, "replace")
+      end
+    end
+
+    h.assert_eq("every rendered table line has an overlay", vim.tbl_count(overlays), #rendered_lines)
+    h.assert_eq("every rendered table line hides secondary syntax", vim.tbl_count(concealed_rows), #rendered_lines)
+    h.assert_eq("Reader uses one authoritative extmark per rendered table line", #marks, #rendered_lines)
+    h.assert_true("regression sample retains code underscores", underscore_chunks > 0)
+
+    for row, line in ipairs(rendered_lines) do
+      h.assert_eq("overlay text exactly matches real Reader line " .. row, overlays[row - 1], line)
+      h.assert_true("narrow regression line fits the window " .. row, vim.api.nvim_strwidth(line) <= 90)
+    end
+
+    h.assert_true(
+      "source with underscore code is unchanged",
+      vim.deep_equal(vim.api.nvim_buf_get_lines(source_bufnr, 0, -1, false), source_lines)
+    )
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader toggle switches between rendered and source views", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+
+  plugin.setup({ auto_preview = false })
+
+  h.with_buffer({
+    "| A | B |",
+    "| --- | --- |",
+    "| one | two |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+
+    local reader_bufnr = plugin.toggle_reader()
+    h.assert_true("toggle opens reader", reader.is_reader(reader_bufnr))
+    h.assert_true("toggle closes reader", plugin.toggle_reader())
+    h.assert_eq("toggle restores source", vim.api.nvim_get_current_buf(), source_bufnr)
+    h.assert_true("closed reader pauses source", plugin.state.paused_buffers[source_bufnr])
+
+    local reopened = plugin.toggle_reader()
+    h.assert_true("toggle reopens reader", reader.is_reader(reopened))
+    h.assert_eq("reopening clears pause", plugin.state.paused_buffers[source_bufnr], nil)
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader gx opens table link metadata", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  local opened = nil
+  local original_open = vim.ui.open
+  vim.ui.open = function(url)
+    opened = url
+  end
+
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+    max_width_ratio = 1,
+    min_col_width = 4,
+    max_col_width = 40,
+  })
+
+  h.with_buffer({
+    "| Name | Link |",
+    "| --- | --- |",
+    "| Video | [YouTube](https://youtube.com/watch) |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    local reader_bufnr = plugin.reader_preview()
+    local built = reader._build(source_bufnr, plugin.config)
+    local target = nil
+
+    for row, line_object in ipairs(built.line_objects) do
+      for _, chunk in ipairs(type(line_object) == "table" and line_object.chunks or {}) do
+        if chunk.kind == "link" and chunk.url then
+          target = { row, chunk.start_col }
+          break
+        end
+      end
+      if target then
+        break
+      end
+    end
+
+    h.assert_true("reader link target exists", target ~= nil)
+    vim.api.nvim_win_set_cursor(0, target)
+    h.assert_true("reader opens link", reader.open_link(reader_bufnr))
+    h.assert_eq("reader opens original URL", opened, "https://youtube.com/watch")
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+
+  vim.ui.open = original_open
+end)
+
+h.test("reader gx refuses unsafe rendered schemes without invoking native fallback", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  local original_open = vim.ui.open
+  local opened = {}
+  vim.ui.open = function(url)
+    table.insert(opened, url)
+  end
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+    link = { allowed_schemes = { "http", "https", "mailto" } },
+  })
+
+  for _, url in ipairs({ "javascript://danger", "javascript:alert(1)", "data:text/plain,danger" }) do
+    h.with_buffer({
+      "| Name | Link |",
+      "| --- | --- |",
+      "| Unsafe | [open](" .. url .. ") |",
+    }, function(source_bufnr)
+      vim.bo[source_bufnr].filetype = "markdown"
+      local reader_bufnr = plugin.reader_preview()
+      local state = reader.get_state(reader_bufnr)
+      local target
+      for row, line_object in ipairs(state.line_objects) do
+        for _, chunk in ipairs(type(line_object) == "table" and line_object.chunks or {}) do
+          if chunk.kind == "link" then
+            target = { row, chunk.start_col }
+          end
+        end
+      end
+      h.assert_true("unsafe Reader target is rendered", target ~= nil)
+      vim.api.nvim_win_set_cursor(0, target)
+      vim.cmd("normal gx")
+      h.assert_eq("unsafe Reader target never reaches the OS", #opened, 0)
+      plugin.close_reader()
+      plugin.state.paused_buffers[source_bufnr] = nil
+    end)
+  end
+
+  vim.ui.open = original_open
+end)
+
+h.test("reader gx uses the source fallback only outside rendered links", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  local fallback_calls = 0
+  local fallback_bufnr = nil
+  local fallback_cursor = nil
+  local opened = nil
+  local original_open = vim.ui.open
+  vim.ui.open = function(url)
+    opened = url
+  end
+
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({
+    "ordinary Markdown prose",
+    "",
+    "| Name | Link |",
+    "| --- | --- |",
+    "| Video | [YouTube](https://youtube.com/watch) |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.keymap.set("n", "gx", function()
+      fallback_calls = fallback_calls + 1
+      fallback_bufnr = vim.api.nvim_get_current_buf()
+      fallback_cursor = vim.api.nvim_win_get_cursor(0)
+    end, { buffer = source_bufnr, desc = "Reader gx fallback test" })
+
+    local reader_bufnr = plugin.reader_preview()
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    vim.cmd("normal gx")
+    h.assert_eq("ordinary Reader text invokes source gx once", fallback_calls, 1)
+    h.assert_eq("Reader fallback executes in Source context", fallback_bufnr, source_bufnr)
+    h.assert_deep_eq("Reader fallback receives mapped Source cursor", fallback_cursor, { 1, 0 })
+    h.assert_true("Source-context fallback keeps Reader visible", reader.is_reader(reader_bufnr))
+
+    local state = reader.get_state(reader_bufnr)
+    local target = nil
+    for row, line_object in ipairs(state.line_objects) do
+      for _, chunk in ipairs(type(line_object) == "table" and line_object.chunks or {}) do
+        if chunk.kind == "link" then
+          target = { row, chunk.start_col }
+          break
+        end
+      end
+      if target then
+        break
+      end
+    end
+
+    h.assert_true("Reader rendered target exists", target ~= nil)
+    vim.api.nvim_win_set_cursor(0, target)
+    vim.cmd("normal gx")
+    h.assert_eq("rendered target opens original URL", opened, "https://youtube.com/watch")
+    h.assert_eq("rendered target does not also invoke fallback", fallback_calls, 1)
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+
+  vim.ui.open = original_open
+end)
+
+h.test("reader source editing restores the mapped source line", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+    max_width_ratio = 1,
+    min_col_width = 4,
+    max_col_width = 16,
+  })
+
+  h.with_buffer({
+    "Before",
+    "| Name | Description |",
+    "| --- | --- |",
+    "| Row | content that wraps across several rendered rows |",
+    "After",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.api.nvim_win_set_width(0, 48)
+    local reader_bufnr = plugin.reader_preview()
+    local built = reader._build(source_bufnr, plugin.config)
+    local reader_lnum = built.source_to_reader[4]
+
+    h.assert_true("wrapped source row is mapped", reader_lnum ~= nil)
+    vim.api.nvim_win_set_cursor(0, { reader_lnum, 0 })
+    h.assert_true("reader edit returns to source", reader.edit(reader_bufnr, nil, true))
+    h.assert_eq("reader restores source buffer", vim.api.nvim_get_current_buf(), source_bufnr)
+    h.assert_eq("reader restores source row", vim.api.nvim_win_get_cursor(0)[1], 4)
+    h.assert_true("explicit source editing pauses reader", plugin.state.paused_buffers[source_bufnr])
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader :write saves the backing Markdown source", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  local path = vim.fn.tempname() .. ".md"
+
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({
+    "# Notes",
+    "",
+    "| A | B |",
+    "| --- | --- |",
+    "| one | two |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].buftype = ""
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.api.nvim_buf_set_name(source_bufnr, path)
+    vim.bo[source_bufnr].modified = true
+
+    local reader_bufnr = plugin.reader_preview()
+    h.assert_true("reader buffer is active before write", reader.is_reader(reader_bufnr))
+    h.assert_true("reader mirrors unsaved source state", vim.bo[reader_bufnr].modified)
+    vim.cmd("write")
+
+    h.assert_true("reader remains active after write", reader.is_reader(vim.api.nvim_get_current_buf()))
+    h.assert_false("reader no longer mirrors a modified source", vim.bo[reader_bufnr].modified)
+    h.assert_false("source is no longer modified", vim.bo[source_bufnr].modified)
+    h.assert_true(
+      "source Markdown was written",
+      vim.deep_equal(vim.fn.readfile(path), {
+        "# Notes",
+        "",
+        "| A | B |",
+        "| --- | --- |",
+        "| one | two |",
+      })
+    )
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+
+  vim.fn.delete(path)
+end)
+
+h.test("reader :x writes unsaved source changes before closing", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+  local path = vim.fn.tempname() .. ".md"
+
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({ "# Unsaved source" }, function(source_bufnr)
+    vim.bo[source_bufnr].buftype = ""
+    vim.bo[source_bufnr].filetype = "markdown"
+    vim.api.nvim_buf_set_name(source_bufnr, path)
+    vim.bo[source_bufnr].modified = true
+    local source_bufhidden = vim.bo[source_bufnr].bufhidden
+    vim.cmd("vsplit")
+
+    local reader_bufnr = plugin.reader_preview()
+    h.assert_true("reader tracks unsaved source before :x", vim.bo[reader_bufnr].modified)
+    vim.cmd("x")
+
+    h.assert_false("reader is gone after :x", reader.is_reader(reader_bufnr))
+    h.assert_eq("source buffer remains visible", vim.api.nvim_get_current_buf(), source_bufnr)
+    h.assert_false("source is saved by :x", vim.bo[source_bufnr].modified)
+    h.assert_eq("source bufhidden is restored after :x", vim.bo[source_bufnr].bufhidden, source_bufhidden)
+    h.assert_true("source was written by :x", vim.deep_equal(vim.fn.readfile(path), { "# Unsaved source" }))
+  end)
+
+  vim.fn.delete(path)
+end)
+
+h.test("reader refreshes all rendered tables after source changes", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({
+    "Before",
+    "| A | B |",
+    "| --- | --- |",
+    "| old | first |",
+    "",
+    "| C | D |",
+    "| --- | --- |",
+    "| second | unchanged |",
+    "After",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    local reader_bufnr = plugin.reader_preview()
+
+    vim.api.nvim_buf_set_lines(source_bufnr, 3, 4, false, { "| updated value | first |" })
+    h.assert_true("reader refresh succeeds", reader.refresh(reader_bufnr))
+
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(reader_bufnr, 0, -1, false), "\n")
+    local top_borders = select(2, rendered:gsub("╭", ""))
+    h.assert_true("reader includes changed source text", rendered:find("updated", 1, true) ~= nil)
+    h.assert_false("reader drops stale source text", rendered:find("old", 1, true) ~= nil)
+    h.assert_eq("reader still renders every table", top_borders, 2)
+    h.assert_eq(
+      "source is not rewritten by refresh",
+      vim.api.nvim_buf_get_lines(source_bufnr, 3, 4, false)[1],
+      "| updated value | first |"
+    )
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader reports a useful save error for unnamed source buffers", function()
+  local plugin = require("markdown-table-wrap")
+  local reader = require("markdown-table-wrap.reader")
+
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({ "| A | B |", "| --- | --- |", "| one | two |" }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    local reader_bufnr = plugin.reader_preview()
+    local ok, err = reader.write(reader_bufnr)
+
+    h.assert_false("unnamed reader save fails safely", ok)
+    h.assert_true("unnamed reader save explains next step", err:find("no file name", 1, true) ~= nil)
+    h.assert_true("reader stays visible after failed save", reader.is_reader(vim.api.nvim_get_current_buf()))
+
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("Reader visibly reports excess Source cells", function()
+  local plugin = require("markdown-table-wrap")
+  plugin.setup({ auto_preview = false, preview_mode = "reader" })
+
+  h.with_buffer({
+    "| A | B |",
+    "| --- | --- |",
+    "| one | two | excess |",
+  }, function(source_bufnr)
+    vim.bo[source_bufnr].filetype = "markdown"
+    local reader_bufnr = plugin.reader_preview()
+    local text = table.concat(vim.api.nvim_buf_get_lines(reader_bufnr, 0, -1, false), "\n")
+    h.assert_true("Reader includes the excess-cell warning", text:find("+1 excess Source cell", 1, true) ~= nil)
+    plugin.close_reader()
+    plugin.state.paused_buffers[source_bufnr] = nil
+  end)
+end)
+
+h.test("reader safely hides an unsaved source when hidden is disabled", function()
+  local plugin = require("markdown-table-wrap")
+
+  plugin.setup({
+    auto_preview = false,
+    preview_mode = "reader",
+  })
+
+  local original_hidden = vim.o.hidden
+  vim.o.hidden = false
+  local source_bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(source_bufnr)
+  vim.bo[source_bufnr].swapfile = false
+  vim.api.nvim_buf_set_lines(source_bufnr, 0, -1, false, {
+    "| A | B |",
+    "| --- | --- |",
+    "| one | two |",
+  })
+  vim.bo[source_bufnr].filetype = "markdown"
+  vim.bo[source_bufnr].bufhidden = ""
+  vim.bo[source_bufnr].modified = true
+
+  local reader_bufnr = plugin.reader_preview()
+  h.assert_true("reader opens for unsaved source", reader_bufnr ~= nil)
+  h.assert_eq("source temporarily uses bufhidden hide", vim.bo[source_bufnr].bufhidden, "hide")
+  plugin.close_reader()
+  h.assert_eq("source bufhidden is restored", vim.bo[source_bufnr].bufhidden, "")
+  h.assert_true("unsaved source remains modified", vim.bo[source_bufnr].modified)
+  plugin.state.paused_buffers[source_bufnr] = nil
+  vim.api.nvim_buf_delete(source_bufnr, { force = true })
+  vim.o.hidden = original_hidden
+end)

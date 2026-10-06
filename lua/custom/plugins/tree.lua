@@ -36,7 +36,25 @@ require('neo-tree').setup {
   },
 }
 
+local function open_tree(opts)
+  local buf = vim.api.nvim_get_current_buf()
+  if vim.b[buf].markdown_table_wrap_reader == true then
+    -- Reveal the backing file without switching out of Reader. Never fall back
+    -- to its virtual URI if the source has been deleted or is unnamed.
+    opts.reveal = false
+    local source = vim.b[buf].markdown_table_wrap_source
+    if type(source) == 'number' and vim.api.nvim_buf_is_valid(source) then
+      local path = vim.api.nvim_buf_get_name(source)
+      if path ~= '' then opts.reveal_file = path end
+    end
+  end
+  require('neo-tree.command').execute(opts)
+end
+
 -- Toggle the tree (reveals current file's location); press again to close.
-vim.keymap.set('n', '<leader>e', '<Cmd>Neotree toggle reveal left<CR>', { desc = 'File [E]xplorer toggle', silent = true })
+vim.keymap.set('n', '<leader>e', function() open_tree { toggle = true, reveal = true, position = 'left' } end, {
+  desc = 'File [E]xplorer toggle',
+  silent = true,
+})
 -- Jump focus into the tree without toggling it.
-vim.keymap.set('n', '<leader>o', '<Cmd>Neotree focus<CR>', { desc = 'Focus file explorer', silent = true })
+vim.keymap.set('n', '<leader>o', function() open_tree { action = 'focus' } end, { desc = 'Focus file explorer', silent = true })

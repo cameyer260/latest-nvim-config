@@ -1,0 +1,1025 @@
+*markdown-table-wrap.txt*  Wrapped Markdown pipe table rendering for Neovim
+
+==============================================================================
+CONTENTS                                      *markdown-table-wrap-contents*
+
+1. Overview                         |markdown-table-wrap-overview|
+2. View choice                      |markdown-table-wrap-view-choice|
+3. Installation                     |markdown-table-wrap-installation|
+4. Commands                         |markdown-table-wrap-commands|
+5. Configuration                    |markdown-table-wrap-configuration|
+6. Lua API                          |markdown-table-wrap-api|
+7. Highlights                       |markdown-table-wrap-highlights|
+8. render-markdown.nvim             |markdown-table-wrap-render-markdown|
+9. Limitations                      |markdown-table-wrap-limitations|
+
+==============================================================================
+OVERVIEW                                      *markdown-table-wrap-overview*
+
+markdown-table-wrap.nvim renders Markdown pipe tables with wrapped cell
+content. Automatic rendering does not modify the source Markdown buffer; the
+explicit Source-aware Reader cell mappings are the guarded editing exception.
+The default display mode is a full-document Reader. Source-position-preserving
+inline replacement and a floating preview remain available as optional modes.
+
+READER MODE
+
+Reader mode mirrors the document into a protected scratch buffer and replaces
+every supported top-level or blockquote-contained pipe table with real Unicode
+buffer lines. Quote depth remains visible and every cell maps to its exact
+physical Source bytes. Rendering
+never modifies the source Markdown buffer. With auto_preview enabled, the default
+reader.auto_open value "has_table" opens Reader only after a table is
+detected.
+Plain Markdown remains in Source. Set reader.auto_open to "always" to open
+Reader for every supported buffer.
+
+Unlike inline extmark replacement, reader mode is not layered over long raw
+table rows. Native wrap therefore cannot reveal source pipes or URLs beneath
+the rendered table.
+
+Rendered table rows are also protected from a second Markdown syntax pass.
+Literal underscores and angle brackets inside rendered code keep their display
+width and cannot move table borders. The underlying Reader rows remain real
+text for search, selection, and yank.
+
+Cell wrapping uses Neovim display width. Inline-code spans remain intact when
+they fit their allocated column; if a code token is wider than that column, it
+is split at character boundaries so narrow Reader and Inline tables keep their
+vertical borders aligned.
+
+Default interaction:
+
+- Normal mode stays in Reader.
+- v/V/CTRL-V select real rendered lines. Yank keeps Reader active.
+- Inside a rendered table cell, |markdown-table-wrap-yic| yanks the original
+  Markdown source, |markdown-table-wrap-vic| selects the complete logical cell
+  across wrapped lines, |markdown-table-wrap-dic| clears only that cell,
+  and |markdown-table-wrap-cic| changes it in Source Insert. After vic, y/d/c/p
+  apply to the same raw Source cell. Neovim's native Source operators own
+  register and one-step undo behavior. Dot repeats the last successful cell
+  mutation while Source is unchanged; undo followed by redo preserves logical
+  repeat. Counts greater than one are rejected without changing Source. These
+  operations preserve the row's other cells and pipe delimiters.
+- Reader reserves Normal-mode y and d for the complete configured cell
+  sequences. By default, any mismatch such as yj, yk, yap, dj, dk, or dd is
+  cancelled without moving the cursor, changing registers/Source, copying
+  rendered borders, or raising E21. Use native v/V/CTRL-V followed by y to
+  copy rendered text, or edit Source for structural deletion.
+- |markdown-table-wrap-cip| is an opt-in compatibility mapping because cip is
+  Vim's native ci-paragraph sequence. |:MarkdownTablePutCell| provides cell put
+  without consuming that default key.
+- |markdown-table-wrap-cell-change| proxies Vim's native Source c operator.
+  cic is resolved first as the cell operation; cip, ciw, cw, c$, and other
+  motions leave Reader and continue in Source. Inside a table row, native cip
+  normally changes the whole contiguous table paragraph; use cic for one cell.
+- Native v/V/CTRL-V behavior is unchanged. Reader adds a visible Visual
+  overlay so selections remain obvious on rendered table cells; the overlay
+  does not change what native Visual mode selects.
+- i/a/I/A/o/O switch to the corresponding source line for editing. Reader
+  reopens after InsertLeave only when auto-preview is enabled and no newer
+  explicit pause/disable has cancelled the handoff. Fast typed text is kept
+  behind the native insert key, including with debounce_ms=0.
+- u/CTRL-R leave Reader to undo/redo in Source, honoring Source mappings and
+  counts. Normal automatic preview policy applies afterwards. Configure or
+  disable these keys with mappings.reader.undo / mappings.reader.redo.
+- :w, :wq, :x, and ZZ save the backing Markdown source directly. The rendered
+  Reader buffer is never written to disk; :wq then quits as usual.
+- |:MarkdownTableToggleReader| switches between Reader and Source.
+- |:MarkdownTableEditSource| leaves Reader and pauses automatic reopening.
+- gx in Reader opens the original target under a rendered link. Away from a
+  target it delegates to the Source mapping captured when Reader opened, or to
+  native gx when available. Source-buffer gx is left untouched by default;
+  native buffer/window navigation dismisses Reader without pausing Source, so
+  returning to an auto-preview Source restores Reader. Turning `'diff'` on in a
+  Reader window is the same class of temporary leave: Source is shown for the
+  diff, then Reader (including a manually opened one) returns when `'diff'`
+  turns off. Explicit close/edit or disable actions keep their persistent
+  pause semantics. Shared-Source Readers restore independently per window.
+  Reader commands refuse to open in an active diff window without changing
+  Source or preview policy. Existing Inline overlays are buffer-scoped and
+  are not suspended per diff window.
+  see |markdown-table-wrap-map-gx|.
+
+FILE WRITES AND SESSIONS
+
+Reader file writes forward :write {path}, !, ++ options, :saveas, and append
+to the canonical Source. A rendered line range maps to its complete physical
+Source lines (a wrapped cell fragment therefore writes its Source row). Stale
+ranges are refused until refresh. Source write hooks and readonly checks apply.
+An unnamed Source needs :write {path}. :saveas renames Source, not the Reader.
+
+Saved session Reader URIs carry an encoded Source path. Loading a session
+resolves named Readers back to Source; normal auto-preview policy may reopen
+Reader afterwards. Legacy/unnamed URIs remain protected placeholders with a
+warning. Modified placeholders are kept for recovery, never silently discarded.
+Sessions do not save unsaved document text; save Source before closing Neovim.
+
+Native shell operations are different: :write !{cmd} sends the current rendered
+buffer to the shell and cannot reliably be intercepted by BufWriteCmd. Use q
+or :MarkdownTableEditSource first when a filter needs raw Markdown. No global
+'shelltemp' option is changed. Native Visual yanks likewise copy rendered text.
+
+CELL OPERATIONS                              *markdown-table-wrap-cell-operations*
+
+The Reader cell mappings operate on one logical table cell even when the
+rendered value occupies several wrapped Reader lines. Markdown semantics are
+always taken from the exact Source range, never reconstructed from displayed
+text:
+
+  yic  *markdown-table-wrap-yic*          Yank the raw Source cell with native
+                                          selected-register behavior.
+  vic  *markdown-table-wrap-vic*          Enter Visual mode over every rendered
+                                          segment of the logical cell.
+  dic  *markdown-table-wrap-dic*          Clear only the Source cell content
+                                          with native delete-register behavior.
+  cic  *markdown-table-wrap-cic*          Change the Source cell as one undo
+                                          block and enter Insert mode; Reader
+                                          normally reopens after InsertLeave.
+  .                                       Repeat the last successful Source-cell
+                                          delete, change, or put while Source
+                                          remains unchanged.
+  cip  *markdown-table-wrap-cip*          Optional compatibility mapping for
+                                          Source-cell put. It is disabled by
+                                          default; native cip remains change
+                                          inner paragraph. Prefer
+                                          :MarkdownTablePutCell for cell put.
+  c    *markdown-table-wrap-cell-change*  Leave Reader and continue Vim's
+                                          native Source change operator. cic is
+                                          resolved first as the cell operation.
+
+Reader is a derived, non-modifiable buffer, so its Normal-mode y and d are
+guarded prefixes rather than native operators over rendered rows. The plugin
+consumes the configured suffix and runs only an exact match (yic/dic by
+default); Esc or a mismatch cancels without touching the cursor, registers,
+Source, or Reader. This prevents yj/yk from copying borders and prevents
+dj/dk/dd from raising E21. vic still resolves v + ic in Visual mode. cic
+retains its complete Normal-mode alias while the Source c proxy is installed;
+any other c motion is deliberately replayed against Source. An explicitly
+configured cip instead claims c + ip for cell put. After vic, temporary
+y/d/c/p mappings act on the raw Source cell and restore any previous Visual
+mappings when the logical selection ends. Native v/V/CTRL-V followed by y
+continues selecting and copying rendered Reader text.
+
+The mappings are enabled by default and can be changed under
+|markdown-table-wrap-mappings|. Set mappings.reader.cell to false or
+{ enabled = false } to disable them. Mutations are intentionally limited to a
+single physical Source line and refuse synthetic missing cells, so a malformed
+row is never rewritten implicitly.
+
+VIEW CHOICE                                  *markdown-table-wrap-view-choice*
+
+Use Source for structural editing such as dd, Visual changes, moving rows, or
+changing table delimiters. Use Inline when editing the original buffer while
+keeping a rendered table layer visible. Use Reader for stable full-document
+reading; its i/a/o/e editing commands jump to the mapped Source line.
+
+|:MarkdownTableToggleInline| switches between Source and Inline. From Reader
+it first returns to Source and then enables Inline. Press it again to clear
+Inline and leave Source visible.
+
+For arbitrary source structure, toggle to Source and use normal Visual mode.
+For a logical table cell, use the Source-aware Reader mappings above.
+
+When optional inline mode is selected, complete-table rendering remains the
+default and viewport slicing remains disabled.
+
+If you enable |markdown-table-wrap-inline-viewport-scrolling|, the plugin
+instead keeps inline rendering inside the original source table height and
+lets you move through the rendered slice with |:MarkdownTableScrollDown|,
+|:MarkdownTableScrollUp|,
+|:MarkdownTableScrollTop|, and |:MarkdownTableScrollBottom|.
+
+The plugin is designed to coexist with render-markdown.nvim by letting
+render-markdown.nvim handle non-table Markdown while markdown-table-wrap.nvim
+owns pipe table rendering.
+
+Requirements:
+
+- Neovim 0.10+
+- No external binary dependencies
+
+==============================================================================
+INSTALLATION                                  *markdown-table-wrap-installation*
+
+Example lazy.nvim / LazyVim spec:
+>
+  return {
+    {
+      "ice345/markdown-table-wrap.nvim",
+      ft = { "markdown", "quarto", "rmd" },
+      opts = {},
+    },
+  }
+<
+
+For local development:
+>
+  return {
+    {
+      dir = "~/Code/lazyvim-table/markdown-table-wrap.nvim",
+      ft = { "markdown", "quarto", "rmd" },
+      opts = {},
+    },
+  }
+<
+
+Example LazyVim key bindings:
+>
+  keys = {
+    {
+      "<leader>mr",
+      "<cmd>MarkdownTableToggleReader<cr>",
+      desc = "Toggle Markdown reader/source",
+    },
+    {
+      "<leader>mi",
+      "<cmd>MarkdownTableToggleInline<cr>",
+      desc = "Toggle Markdown table inline view",
+    },
+    {
+      "<leader>me",
+      "<cmd>MarkdownTableEditSource<cr>",
+      desc = "Edit Markdown source",
+    },
+  }
+<
+
+ToggleReader is bidirectional. EditSource is one-way and pauses automatic
+reopening until Reader is explicitly opened again. ToggleInline selects Inline
+for the current buffer's editing session without changing global setup.
+
+Session files should restore Source rather than the disposable Reader or Float
+scratch buffer. After setup, auto_preview and reader.auto_open may recreate a
+view. The plugin does not serialize scratch view buffers into the session.
+
+==============================================================================
+COMMANDS                                      *markdown-table-wrap-commands*
+
+                                                        *:MarkdownTablePreview*
+:MarkdownTablePreview
+    Open the configured preview mode. Defaults to Reader.
+
+                                                  *:MarkdownTableInlinePreview*
+:MarkdownTableInlinePreview
+    Render the table under the cursor inline. From Reader or Float, first map
+    the logical cursor back to Source.
+
+                                                   *:MarkdownTableFloatPreview*
+:MarkdownTableFloatPreview
+    Render the table under the cursor in a floating window. Source, Inline,
+    and Reader are accepted; cross-view transitions retain the logical cell.
+    While the Float is open, a queued automatic Reader refresh cannot replace
+    it. q, <Esc>, |:MarkdownTableClosePreview|, and the preview toggle restore
+    the originating Source, Reader, or Inline view. A Reader origin returns to
+    the same logical cell, including after a Float refresh.
+
+                                                   *:MarkdownTableReader*
+:MarkdownTableReader
+    Open the full Markdown document in the rendered reader. From Float, return
+    through the canonical Source while retaining the mapped cursor.
+
+                                             *:MarkdownTableToggleReader*
+:MarkdownTableToggleReader
+    Switch the current window between Reader and Source. Leaving Reader pauses
+    automatic reopening until this command is run again.
+
+                                               *:MarkdownTableEditSource*
+:MarkdownTableEditSource
+    Leave Reader, pause automatic reopening, and keep Source visible.
+
+                                             *:MarkdownTableToggleInline*
+:MarkdownTableToggleInline
+    Switch between Source and Inline. From Reader, first return to Source and
+    then enable Inline. Float is resolved through Source in the same way. Press
+    again to clear Inline and leave Source visible.
+
+                                                  *:MarkdownTableTogglePreview*
+:MarkdownTableTogglePreview
+    Toggle the active preview. Closing Float restores the view that opened it.
+
+                                                   *:MarkdownTableClosePreview*
+:MarkdownTableClosePreview
+    Close the preview. Float restores its originating Source, Reader, or Inline
+    view; Reader and Inline keep their documented normal close behavior.
+
+                                                        *:MarkdownTableRefresh*
+:MarkdownTableRefresh
+    Force refresh the active Source, Inline, Reader, or Float view.
+
+                                             *:MarkdownTableEnableAutoPreview*
+:MarkdownTableEnableAutoPreview
+    Enable automatic table rendering for the canonical Source. Source, Inline,
+    Reader, and Float are accepted; an active Float remains open.
+
+                                            *:MarkdownTableDisableAutoPreview*
+:MarkdownTableDisableAutoPreview
+    Disable automatic table rendering for the canonical Source. When run in
+    Reader or Float, close that derived view and leave Source visible.
+
+                                             *:MarkdownTableToggleAutoPreview*
+:MarkdownTableToggleAutoPreview
+    Toggle automatic table rendering for the canonical Source from Source,
+    Inline, Reader, or Float.
+
+                                                       *:MarkdownTableStatus*
+:MarkdownTableStatus
+    Show the canonical Source policy and the resolved Source, Inline, Reader,
+    or Float view rather than reporting a derived scratch buffer as Source.
+
+                                           *:MarkdownTableToggleInlineViewport*
+:MarkdownTableToggleInlineViewport
+    Toggle the canonical Source's Inline view between viewport-sliced and full
+    rendering. Source, Inline, Reader, and Float are accepted; Reader and Float
+    remain open because this setting applies to the next/current Inline view.
+
+                                                       *:MarkdownTableNextCell*
+:MarkdownTableNextCell
+    Move to the next logical table cell in Source, Inline, Reader, or Float.
+
+                                                       *:MarkdownTablePrevCell*
+:MarkdownTablePrevCell
+    Move to the previous logical table cell in Source, Inline, Reader, or Float.
+
+                                                        *:MarkdownTableNextRow*
+:MarkdownTableNextRow
+    Move to the same logical table column in the next row.
+
+                                                       *:MarkdownTablePrevRow*
+:MarkdownTablePrevRow
+    Move to the same logical table column in the previous row.
+
+                                                      *:MarkdownTableOpenLink*
+:MarkdownTableOpenLink
+    Compatibility alias for |:MarkdownTableOpen|.
+
+                                                          *:MarkdownTableOpen*
+:MarkdownTableOpen
+    Open the Markdown target under the cursor. Relative files are resolved
+    from the canonical Source path in Source, Inline, Reader, and Float. Local
+    file: URIs open inside Neovim; external schemes must be allowed by
+    |markdown-table-wrap-link| or handled by a custom resolver.
+
+                                                     *:MarkdownTableOpenSplit*
+:MarkdownTableOpenSplit
+    Open a file target in a horizontal split.
+
+                                                    *:MarkdownTableOpenVSplit*
+:MarkdownTableOpenVSplit
+    Open a file target in a vertical split.
+
+                                                       *:MarkdownTableOpenTab*
+:MarkdownTableOpenTab
+    Open a file target in a new tab.
+
+                                                       *:MarkdownTableInspect*
+:MarkdownTableInspect
+    Report mode, Source/view identity, mapped cursor, current table/cell,
+    excess-cell count, width budget, cache state, and effective options.
+
+                                                          *:MarkdownTableHelp*
+:MarkdownTableHelp
+    Open a compact action and configured-key reference. This command remains
+    available when Reader-local mappings are disabled.
+
+                                                     *:MarkdownTableScrollDown*
+:MarkdownTableScrollDown
+    Scroll the rendered table view down.
+
+                                                       *:MarkdownTableScrollUp*
+:MarkdownTableScrollUp
+    Scroll the rendered table view up.
+
+                                                      *:MarkdownTableScrollTop*
+:MarkdownTableScrollTop
+    Jump the rendered table viewport to the top.
+
+                                                   *:MarkdownTableScrollBottom*
+:MarkdownTableScrollBottom
+    Jump the rendered table viewport to the bottom.
+
+                                                   *:MarkdownTableViewportLeft*
+:MarkdownTableViewportLeft
+    Move the explicit wide-table column viewport toward earlier columns.
+    Requires wide_table.mode = "viewport"; otherwise reports that requirement.
+
+                                                  *:MarkdownTableViewportRight*
+:MarkdownTableViewportRight
+    Move the explicit wide-table column viewport toward later columns.
+    Requires wide_table.mode = "viewport"; otherwise reports that requirement.
+
+                                                     *:MarkdownTableYankCell*
+:MarkdownTableYankCell
+    Copy the semantic text displayed by the cell under the cursor. Markdown
+    delimiters, padding, and decorative link icons are omitted; use yic for
+    the raw Source cell. The unnamed and yank registers are updated; system
+    clipboard integration follows 'clipboard'.
+
+                                                      *:MarkdownTablePutCell*
+:MarkdownTablePutCell
+    Replace the current Reader cell with the unnamed register. Register
+    newlines become spaces. Use a mapping to
+    <Plug>(MarkdownTableWrapPutCell) when a selected register is required.
+    Unescaped structural pipes are refused; use \| or a matched code span.
+
+                                                    *:MarkdownTableYankTable*
+:MarkdownTableYankTable
+    Copy one complete rendered table, including its borders and wrapped lines.
+    Register and system clipboard behavior matches |:MarkdownTableYankCell|.
+
+                                                        *:MarkdownTableExport*
+:MarkdownTableExport[!] [tsv|csv]
+    Copy the current table as TSV (the default) or CSV. Add ! to export every
+    table in the Source buffer. TSV uses C-style escapes for tabs/newlines;
+    CSV doubles embedded quotes and quotes fields containing delimiters.
+    CSV is formula-safe by default: values beginning with =, +, -, @, tab or
+    carriage return get an apostrophe prefix. The Lua export API accepts
+    csv_formula_policy="raw" to opt out explicitly; TSV is unchanged.
+    Tables with excess Source cells are refused before registers are changed.
+    Successful exports use the same register/clipboard policy as rendered copy.
+
+                                                       *:MarkdownTableFormat*
+:MarkdownTableFormat
+    Canonicalize the current table in the Source buffer. Rendering never runs
+    this formatter implicitly. Padding is calculated from the raw Markdown
+    Source text, so the rewritten pipe columns remain aligned in Source.
+    Each existing row retains its exact quote prefix and indentation.
+
+                                                      *:MarkdownTableAddRow*
+:MarkdownTableAddRow
+    Add an empty body row after the current row (or at the end of the table).
+
+                                                   *:MarkdownTableDeleteRow*
+:MarkdownTableDeleteRow
+    Delete the current body row. Header and delimiter positions are refused;
+    the header and delimiter remain intact.
+
+                                                  *:MarkdownTableMoveRowUp*
+:MarkdownTableMoveRowUp
+    Move the current body row one position upward. Header and delimiter
+    positions are refused.
+
+                                                *:MarkdownTableMoveRowDown*
+:MarkdownTableMoveRowDown
+    Move the current body row one position downward. Header and delimiter
+    positions are refused.
+
+                                                   *:MarkdownTableAddColumn*
+:MarkdownTableAddColumn
+    Add an empty column after the current column (or at the end of the table).
+
+                                                *:MarkdownTableDeleteColumn*
+:MarkdownTableDeleteColumn
+    Delete the current column. A table must retain at least one column.
+
+                                               *:MarkdownTableMoveColumnLeft*
+:MarkdownTableMoveColumnLeft
+    Move the current column one position to the left.
+
+                                              *:MarkdownTableMoveColumnRight*
+:MarkdownTableMoveColumnRight
+    Move the current column one position to the right.
+
+                                             *:MarkdownTableToggleAlignment*
+:MarkdownTableToggleAlignment
+    Cycle the current column alignment through left, center, and right.
+
+                                                   *:MarkdownTableEditCell*
+:MarkdownTableEditCell
+    Open the current one-line cell Source range in a focused scratch popup.
+    Press CTRL-S to commit one exact Source edit, or ESC/q to cancel. The
+    popup soft-wraps long content and grows to a bounded height while editing.
+    It is not an editable copy of the document and is discarded on close.
+
+Source editing companion commands leave Reader or Float before mutating the
+canonical Source. Each structural or popup commit is one undo step. Commands
+refuse malformed tables with excess cells and make no partial rewrite; missing
+or multi-line cell ranges are also rejected by the popup. The popup uses the
+isolated markdown-table-wrap-cell filetype and is excluded from automatic
+preview discovery.
+Popup cell commits also refuse unescaped structural pipes. Cell and structural
+mutations revalidate Source after view transitions before replacing any bytes.
+
+==============================================================================
+CONFIGURATION                              *markdown-table-wrap-configuration*
+
+Default setup:
+>
+  require("markdown-table-wrap").setup({
+    max_width_ratio = 0.9,
+    min_col_width = 8,
+    max_col_width = 50,
+    fit_to_window = true,
+    border = "rounded",
+    use_unicode_border = true,
+    table_border = "rounded",
+    row_separator = true,
+    preview_mode = "reader",
+    inline_mode = "replace",
+    inline_position = "above",
+    dim_source = true,
+    auto_preview = true,
+    render_all = true,
+    auto_preview_in_insert = false,
+    clear_on_cursor_leave = true,
+    clear_on_insert = true,
+    clear_on_visual = true,
+    debounce_ms = 80,
+    overlay_priority = 10000,
+    overlay_fill = true,
+    inline_virtual_text = "overlay",
+    inline_disable_wrap = true,
+    inline_wrap_scope = "cursor",
+    inline_viewport_scrolling = false,
+    reader = {
+      auto_open = "has_table",
+      wrap = true,
+      linebreak = false,
+      breakindent = true,
+      conceallevel = 2,
+      concealcursor = "nvc",
+      sticky_header = false,
+    },
+    discovery = { backend = "auto" },
+    cache = { enabled = true },
+    highlight_preset = "default",
+    theme_dir = nil,
+    themes = {},
+    extra_filetypes = {},
+    highlights = {},
+    link = {
+      icon = "",
+      allowed_schemes = { "http", "https", "mailto" },
+      wiki = {
+        icon = " ",
+        highlight = "MarkdownTableWrapWikiLink",
+        scope_highlight = "MarkdownTableWrapWikiLink",
+      },
+      image = " ",
+      resolver = nil,
+      custom = {
+        github = { pattern = "github", icon = " " },
+        gitlab = { pattern = "gitlab", icon = "󰮠 " },
+        youtube = { pattern = "youtube", icon = " " },
+        bilibili = { pattern = "bilibili", icon = "󰟴 " },
+        cern = { pattern = "cern.ch", icon = " " },
+      },
+    },
+    map_gx = false,
+    mappings = {
+      reader = {
+        enabled = true,
+        close = "q",
+        edit = "e",
+        undo = "u",
+        redo = "<C-r>",
+        open_link = "gx",
+        help = false,
+        insert = { "i", "a", "I", "A", "o", "O" },
+        passthrough = {},
+        cell = {
+          enabled = true,
+          yank = "yic",
+          visual = "vic",
+          delete = "dic",
+          change = "cic",
+          put = false,
+          change_operator = "c",
+          repeat_change = ".",
+        },
+      },
+      float = {
+        enabled = true,
+        close = { "q", "<Esc>" },
+        open_link = "gx",
+        help = false,
+      },
+    },
+  })
+<
+
+setup() validates values and warns once for unknown fixed option names. Theme
+names, highlight keys, link-pattern names, wide-table column numbers, and
+Reader passthrough keys are intentionally dynamic and do not warn.
+
+reset_state~                         *markdown-table-wrap-reset-state*
+    One-shot setup control. Repeated setup() calls normally preserve
+    per-buffer pause, auto-preview, selected mode, and viewport intent. Pass
+    reset_state = true only to clear those policies during this setup call.
+    It is consumed by setup() and is not part of the effective buffer config.
+
+Important options:
+
+max_width_ratio~
+    Maximum rendered table width as a ratio of the current window width,
+    clamped to 0.1 through 1.0.
+
+min_col_width~
+    Minimum display width for a column.
+
+max_col_width~
+    Maximum natural display width before wrapping.
+
+fit_to_window~
+    Prioritize keeping the complete table inside the current window text area.
+    When necessary, columns may become narrower than min_col_width.
+    No column is narrowed below its widest glyph. An impossible narrow layout
+    intentionally overflows rather than splitting a wide glyph or its border.
+
+preview_mode~
+    "reader" (default), "inline", or "float".
+
+reader~
+    Behavior for the full-document reader. reader.auto_open accepts
+    "has_table" (the default) or "always". "has_table" automatically enters
+    Reader only after a table is detected, so plain Markdown stays in Source.
+    "always" enters Reader for every supported buffer.
+
+    By default ordinary Markdown in Reader uses wrap and breakindent, while
+    linebreak remains disabled. Table rows are already wrapped by the plugin
+    and stay inside the computed text width.
+
+    reader.sticky_header defaults to false. When enabled, the current table's
+    rendered header is shown in the window winbar while the cursor is inside
+    that table. This is visual-only; Reader lines, search, yank, and copied
+    text are unchanged, and the previous winbar is restored outside the table
+    and when Reader closes.
+
+inline_mode~
+    "replace" hides source text and overlays rendered rows.
+    "insert" shows rendered rows above or below the source table.
+
+inline_virtual_text~
+    "overlay" or "win_col" for the replace-mode virtual text strategy.
+    "overlay" is the default and is generally the most portable choice.
+
+inline_disable_wrap~
+                                *markdown-table-wrap-inline-disable-wrap*
+    Enables the temporary nowrap protection for inline replace mode. Long
+    concealed source rows can otherwise soft-wrap underneath the rendered
+    table on some terminal and platform combinations.
+
+inline_wrap_scope~
+    Controls where |markdown-table-wrap-inline-disable-wrap| applies:
+
+    "always" disables wrap for the whole window while inline tables are
+       active. This is the strictest and most stable setting.
+
+    "cursor" (the default) disables wrap only while the cursor is inside a
+    rendered table, then restores the previous window-local wrap setting so
+    ordinary Markdown paragraphs continue to wrap normally.
+
+    "never" leaves wrap fully under user control. This may allow concealed
+    source rows to leak or flicker on long tables.
+
+clear_on_visual~
+    In inline mode, reveal source Markdown while selecting text and re-render
+    after leaving Visual mode. Reader mode selects real rendered lines and
+    stays active after yank.
+
+clear_on_insert~
+    Defaults to true: clear replace-mode Inline on InsertEnter. False retains
+    the projection with Source still concealed during Insert. When
+    auto_preview_in_insert=false, it stays stable until InsertLeave; true opts
+    into live updates while typing.
+
+auto_preview~
+    Automatically render supported buffers. In Reader mode, automatic opening
+    also follows reader.auto_open.
+
+render_all~
+    Render all tables in the current Markdown buffer.
+
+discovery~
+    Select the table-range discovery backend: "auto", "lua", or
+    "treesitter". Auto currently uses the guaranteed Lua scanner. Explicit
+    Tree-sitter discovery falls back to Lua if a compatible parser or table
+    node is unavailable. The requested backend, selected backend, and fallback
+    reason are shown by |:MarkdownTableInspect|.
+
+cache~
+    cache.enabled defaults to true. Parsing is keyed by Source changedtick;
+    layout additionally uses window width and relevant configuration. Buffer
+    wipe releases every owned entry. See docs/performance.md in the repository
+    for the benchmark and reference resource budgets.
+
+Wrapping prefers whitespace and common Latin/CJK punctuation boundaries,
+including Chinese `、，。！？；：`, without splitting multibyte characters.
+Rendered tabs become single spaces so real Reader lines and virtual-text
+columns agree; raw Source and structured export retain their original values.
+
+highlight_preset~                  *markdown-table-wrap-highlight-preset*
+    "default", "tokyonight", "catppuccin", "render_markdown", "auto", or a
+    custom key supplied through |markdown-table-wrap-themes| or
+    |markdown-table-wrap-theme-dir|. The default preset links to standard
+    Neovim highlight groups so it works naturally with arbitrary colorschemes.
+
+theme_dir~                              *markdown-table-wrap-theme-dir*
+    Optional directory containing custom theme files named <preset>.lua.
+    Matching files are executed with dofile(); configure only a directory of
+    trusted Lua code.
+    Preset names must be single components (Unicode is allowed). Separators,
+    traversal names, and files resolving through symlinks outside this
+    directory are refused.
+
+themes~                                    *markdown-table-wrap-themes*
+    Inline custom theme table keyed by |markdown-table-wrap-highlight-preset|.
+    For example, set highlight_preset = "my_theme" and provide
+    themes.my_theme.
+
+inline_viewport_scrolling~
+                         *markdown-table-wrap-inline-viewport-scrolling*
+    When enabled, |:MarkdownTableScrollDown| and |:MarkdownTableScrollUp|
+    page through rendered rows inside the original table height.
+
+    When disabled, the complete rendered table is shown inline with extra
+    virtual lines. This is the default because it is less surprising on first
+    use. In that mode, scroll commands fall back to normal window scrolling
+    because the table is already expanded visually.
+
+wide_table~                         *markdown-table-wrap-wide-table*
+    Optional policies for wide tables. The default mode is "wrap", preserving
+    the existing fit-and-wrap layout. Set mode = "viewport" to render a
+    contiguous column slice with a marker (default …) on each hidden side.
+    viewport.start_column and viewport.column_count choose the slice; the
+    :MarkdownTableViewportLeft/Right commands move it. columns[n] accepts
+    width (fixed), min, max, weight, and priority. Fixed widths are retained;
+    when constraints cannot fit, layout.overflow is true in the rendered model
+    and the best-effort result is deterministic. allocate_extra = true uses
+    weight to distribute spare width.
+
+If a body row contains cells beyond the header width, rendered views append a
+DiagnosticWarn-highlighted "⚠ +N excess Source cell(s)" line. The Source data
+is preserved; structured export and structural editing refuse the table.
+
+link~                                      *markdown-table-wrap-link*
+    Icon configuration for links, wiki links, images, and URL pattern matches.
+    link.allowed_schemes defaults to { "http", "https", "mailto" }. Unknown
+    external schemes are refused unless listed here or handled by the custom
+    resolver. Local file: URIs are resolved as files and open inside Neovim;
+    remote file URI hosts are refused.
+
+    link.resolver may be a function(target, context, strategy). Return true or
+    "noop" when handled, false to cancel, or "edit", "split", "vsplit", or
+    "tab" to select built-in file opening.
+    Standard Markdown links use [text](url). The plugin also accepts
+    (text)[url] as a convenience form inside table cells.
+    Raw and percent-decoded control bytes are refused in local paths.
+    file://./relative.md is Source-relative; localhost is case-insensitive.
+
+mappings~                              *markdown-table-wrap-mappings*
+    Configure or disable Reader and Float buffer-local mappings. Set
+    mappings.reader = false or mappings.reader.enabled = false to install no
+    Reader-local mappings. Commands and documented <Plug> mappings remain.
+
+    mappings.reader.passthrough explicitly captures a Source mapping. A value
+    may name a plugin action such as "next_buffer", or use a table containing
+    policy = "leave", "source", or "view". No passthrough is installed by
+    default. The next_buffer, previous_buffer, alternate_buffer, and explicit
+    buffer-selection actions are temporary navigation: they do not set the
+    Source pause flag. Returning to an automatic Reader Source rebuilds Reader
+    at its saved cursor and scroll position; a paused Source remains Source.
+
+    mappings.reader.cell controls Source-aware operations on the logical cell
+    under the Reader cursor. Its defaults are yic (raw Source yank), vic
+    (logical rendered-cell Visual selection), dic (clear Source content), cic
+    (change in Source Insert), c (native Source change-operator proxy), and .
+    (cell repeat). put defaults to false so Vim's native cip remains available
+    from Reader prose and table cells; set put = "cip" only as an explicit
+    compatibility opt-in. Set the cell table to false or { enabled = false }
+    to disable these mappings. A cell mutation is restricted to one physical
+    Source line; register newlines are flattened to spaces so table row
+    structure remains valid. With operator-prefixed yank/delete mappings,
+    Reader reserves those first keys and cancels every non-matching suffix;
+    use native Visual selection for rendered copy.
+
+    mappings.reader.copy_cell and copy_table optionally install local keys for
+    the semantic rendered-cell and complete rendered-table copy actions. Both
+    default to false, so no additional Reader key is consumed by default.
+
+    Source editing companion commands do not add default normal-mode keys.
+    Their stable actions and <Plug> mappings are documented under
+    |markdown-table-wrap-api|. They always leave Reader/Float before a Source
+    rewrite and refuse excess-cell tables without partial changes.
+>
+      mappings = {
+        reader = {
+          passthrough = {
+            H = "previous_buffer",
+            L = "next_buffer",
+            gf = "open",
+          },
+        },
+      }
+<
+
+map_gx~                                    *markdown-table-wrap-map-gx*
+    Opt into a buffer-local gx mapping for table links in Source buffers.
+    Defaults to false, leaving the user's existing mapping untouched. Reader
+    links remain directly openable. |:MarkdownTableOpen| can also be
+    mapped manually.
+
+extra_filetypes~
+    List of additional filetypes to enable table rendering for. The default
+    is {}, meaning the built-in markdown, md, quarto, rmd, and rmarkdown
+    filetypes render tables. Example:
+>
+      require("markdown-table-wrap").setup({
+        extra_filetypes = { "text" },
+      })
+<
+    NOTE for LazyVim users: If you add extra filetypes, you must also
+    include them in the plugin's ft list to load the plugin for those
+    filetypes:
+>
+      return {
+        {
+          "ice345/markdown-table-wrap.nvim",
+          ft = { "markdown", "quarto", "rmd", "text" },
+          opts = {
+            extra_filetypes = { "text" },
+          },
+        },
+      }
+<
+
+==============================================================================
+LUA API                                      *markdown-table-wrap-api*
+
+The inspection helpers return effective per-buffer state without changing it.
+
+get_buffer_config({bufnr})~      *markdown-table-wrap.get_buffer_config()*
+    Return a deep-copied effective configuration for {bufnr}, including
+    runtime view, auto-preview, and inline-viewport overrides. Omit {bufnr} or
+    pass 0 for the current buffer.
+    Reader/Float buffer numbers resolve to their canonical Source overrides.
+
+get_preview_mode({bufnr})~          *markdown-table-wrap.get_preview_mode()*
+    Return the effective "reader", "inline", or "float" mode for {bufnr}
+    without mutating global setup. Omit {bufnr} or pass 0 for the current
+    buffer.
+
+get_state({bufnr})~                        *markdown-table-wrap.get_state()*
+    Return a copied active context with mode, canonical Source, view/window,
+    mapped cursor, table/cell, cache, and effective configuration. Return nil
+    plus an error when the requested view is invalid.
+    An unexpected parser exception is retained as parse_error and shown by
+    Inspect, distinct from an ordinary cursor outside a table.
+
+parser.parse_lines({lines}, {opts})~
+    Pure line-array API returning Source-spanned table, delimiter, row, cell,
+    and inline-token models. parser.parse_all({bufnr}, {opts}) is the thin
+    live-buffer adapter that adds Source identity and changedtick caching.
+
+discovery.status({bufnr}) / cache.inspect({bufnr})~
+    Return discovery backend/fallback and cache-stage diagnostics without
+    changing the active view.
+
+resolve_source_buffer({bufnr})~
+                         *markdown-table-wrap.resolve_source_buffer()*
+    Return the canonical Source buffer behind Source, Inline, Reader, or
+    Float.
+
+action({name}, {opts})~                       *markdown-table-wrap.action()*
+    Run a stable mode-agnostic action. Common names are toggle_reader,
+    toggle_inline, edit_source, close, refresh, open, open_split,
+    open_vsplit, open_tab, next_buffer, previous_buffer, alternate_buffer,
+    split_source, vsplit_source, tab_source, inspect, help, copy_cell, put_cell,
+    copy_table, export_tsv, export_csv, viewport_left, viewport_right,
+    format_table, add_row_table, delete_row_table, move_row_up_table,
+    move_row_down_table, add_column_table, delete_column_table,
+    move_column_left_table, move_column_right_table,
+    toggle_alignment_table, and open_cell_popup_table.
+
+edit_table({action}, {opts})~
+    Run one explicit Source editing operation. {action} is one of format,
+    add_row, delete_row, move_row_up, move_row_down, add_column,
+    delete_column, move_column_left, move_column_right, toggle_alignment, or
+    open_cell_popup. Structural rewrites and popup commits each form one undo
+    step; rendering never calls this API implicitly.
+
+statusline({bufnr})~                       *markdown-table-wrap.statusline()*
+    Return a compact component such as "MTW Reader T2:C2", or an empty string
+    for an invalid context. The table row is logical (header is row 1), not a
+    physical Source-buffer line number.
+
+Stable normal-mode <Plug> mappings use the following names:
+
+- <Plug>(MarkdownTableWrapToggleReader)
+- <Plug>(MarkdownTableWrapToggleInline)
+- <Plug>(MarkdownTableWrapEditSource)
+- <Plug>(MarkdownTableWrapClose)
+- <Plug>(MarkdownTableWrapRefresh)
+- <Plug>(MarkdownTableWrapOpen), OpenSplit, OpenVSplit, and OpenTab
+- <Plug>(MarkdownTableWrapNextBuffer), PreviousBuffer, and AlternateBuffer
+- <Plug>(MarkdownTableWrapSplitSource), VSplitSource, and TabSource
+- <Plug>(MarkdownTableWrapInspect) and Help
+- <Plug>(MarkdownTableWrapCopyCell), PutCell, and CopyTable
+- <Plug>(MarkdownTableWrapExportTSV) and ExportCSV
+- <Plug>(MarkdownTableWrapViewportLeft) and ViewportRight
+- <Plug>(MarkdownTableWrapFormatTable), AddRow, DeleteRow, MoveRowUp, and
+  MoveRowDown
+- <Plug>(MarkdownTableWrapAddColumn), DeleteColumn, MoveColumnLeft, and
+  MoveColumnRight
+- <Plug>(MarkdownTableWrapToggleAlignment) and EditCell
+
+The plugin emits User events MarkdownTableWrapReaderEnter,
+MarkdownTableWrapReaderLeave, MarkdownTableWrapViewChanged, and
+MarkdownTableWrapRendered. On supported Neovim versions, autocmd callbacks can
+read primitive Source/view identifiers from args.data.
+
+Example:
+>
+  local table_wrap = require("markdown-table-wrap")
+  local config = table_wrap.get_buffer_config(0)
+  local mode = table_wrap.get_preview_mode(0)
+  local context = table_wrap.get_state(0)
+  local source = table_wrap.resolve_source_buffer(0)
+  local component = table_wrap.statusline(0)
+<
+
+==============================================================================
+HIGHLIGHTS                                  *markdown-table-wrap-highlights*
+
+Highlight groups:
+
+- MarkdownTableWrapBorder
+- MarkdownTableWrapHeader
+- MarkdownTableWrapInline
+- MarkdownTableWrapSource
+- MarkdownTableWrapCode
+- MarkdownTableWrapBold
+- MarkdownTableWrapItalic
+- MarkdownTableWrapStrike
+- MarkdownTableWrapLink
+- MarkdownTableWrapWikiLink
+- MarkdownTableWrapImage
+- MarkdownTableWrapMark
+- MarkdownTableWrapBlank
+
+Semantic highlight groups are reapplied after ColorScheme. A direct custom
+spec replaces the preset's linked base for that semantic key.
+
+Content highlight keys are background-transparent when they only link to an
+existing highlight group. This prevents Inline replace mode from drawing a
+filled rectangle for every cell when a colorscheme gives Normal, Title, or
+another linked group a background. Add an explicit `bg` to opt into a filled
+background; `blank` is only the padding highlight and can usually be `{}`.
+
+Inline-code delimiters inside link or image labels are removed from the
+display text before width calculation. This keeps concealed backticks from
+shifting the rendered table separators in Inline mode.
+
+Override by semantic key:
+>
+  require("markdown-table-wrap").setup({
+    highlights = {
+      code = { fg = "#9ece6a" },
+      bold = { fg = "#e0af68", bold = true },
+      link = { fg = "#7dcfff", underline = true },
+      mark = { fg = "#1a1b26", bg = "#e0af68" },
+    },
+  })
+<
+
+==============================================================================
+RENDER-MARKDOWN.NVIM                    *markdown-table-wrap-render-markdown*
+
+To avoid double table rendering, disable render-markdown.nvim pipe tables:
+>
+  return {
+    "MeanderingProgrammer/render-markdown.nvim",
+    opts = {
+      pipe_table = {
+        enabled = false,
+      },
+    },
+  }
+<
+
+==============================================================================
+LIMITATIONS                                *markdown-table-wrap-limitations*
+
+- Inline replacement uses virtual text and optional virtual lines. These are
+  visual rows, not real buffer rows. Use |:MarkdownTableScrollDown| /
+  |:MarkdownTableScrollUp| to page through the inline rendered slice, or use
+  |:MarkdownTableReader| / |:MarkdownTableFloatPreview| for a normal
+  scrollable preview buffer.
+- Terminal and platform combinations can differ in how wrap, conceal, and
+  virtual text interact. The default
+  |markdown-table-wrap-inline-disable-wrap| setting exists to prevent
+  concealed long source rows from leaking through below the rendered table on
+  some terminal setups. Reader mode avoids this extmark/wrap interaction
+  entirely.
+- Tree-sitter discovery is optional and diagnostic. Auto intentionally keeps
+  the deterministic Lua scanner until measurements justify preferring it.
+- Blockquote-contained tables are supported, including nested quote depth,
+  spacing variants, and exact Source-cell operations. List-contained tables
+  remain unsupported because Markdown continuation indentation does not yet
+  provide a guaranteed lossless Source mapping. A list start safely terminates
+  a neighboring supported table.
+- The plugin focuses on Markdown pipe tables and does not replace general
+  Markdown rendering.
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

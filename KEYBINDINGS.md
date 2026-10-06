@@ -52,6 +52,39 @@ a sticky header. The original file contents remain unchanged.
 | `:CsvViewToggle` | Toggle the table display for the current buffer. |
 | `:CsvViewEnable` / `:CsvViewDisable` | Explicitly show / hide the table display. |
 
+## Markdown tables and rendering
+
+Documents containing Markdown tables automatically open in Reader in the same
+window. Long cells wrap within aligned columns fitted to the window. Reader is a
+protected display buffer; rendering never rewrites the original `.md` file.
+Documents without tables keep the usual in-buffer Markdown styling. The table
+Reader is a local fork in `vendor/markdown-table-wrap.nvim/`; ordinary plugin
+updates do not overwrite it. The file explorer remains a left sidebar.
+
+| Key / command | Action |
+|---|---|
+| `w`, `b`, `e`, `0`, `$` | Native Vim navigation through the actual displayed text. |
+| `<leader>mr` | Toggle Reader / editable Source for the current document. |
+| `<leader>me` / `q` | Return to Source and stay there until Reader is reopened. |
+| `i`, `a`, `I`, `A`, `o`, `O` | Edit at the mapped Source position; leaving Insert mode automatically reopens Reader. |
+| `u` / `Ctrl+r` | Undo / redo changes in Source. |
+| `v`, `V`, `Ctrl+v`, then `y` | Select and copy the visible rendered text. |
+| `yic` / `dic` / `cic` | Yank / delete / change the raw Source cell under the cursor. |
+| `:w` / `:wq` / `:x` / `ZZ` | Save the backing Markdown Source, never the rendered borders. |
+| `:MarkdownTableRefresh` | Rebuild the rendered document. |
+| `:MarkdownTableHelp` | Show Reader actions and effective keys. |
+
+Reader keeps the backing file's tab highlighted, without adding a duplicate tab.
+The file's buffer tabs stay navigable with `Shift+H` / `Shift+L` and
+`<leader><leader>`. `<leader>f` formats Source, not the generated display.
+`<leader>e` / `<leader>o` reveal the backing Markdown file in the explorer without
+leaving Reader or treating its virtual buffer as a filesystem path.
+`<leader>bd` and the tab's close button/right-click close the backing file and all
+its Reader views, not just the virtual display. Unsaved Source edits get Neovim's
+normal save/discard/cancel prompt rather than being silently discarded.
+Reader guards Normal-mode `y` and `d` for cell operations; use Visual selection
+to copy rendered rows, or return to Source for ordinary structural edits such as `dd`.
+
 ## Search and replace
 
 | Key / command | Action |
@@ -114,8 +147,11 @@ These are available in files inside a Git repository. The gutter uses `+` for ad
 | `gc` (Visual) / `gcc` | Toggle comment for selection / line. |
 | `saiw)` / `sd'` / `sr)'` | Add / delete / replace surrounding delimiters. |
 
-The system clipboard is enabled, so normal `y` and `p` use the system clipboard
-(needs a clipboard provider on Linux — `xclip`/`xsel`/`wl-copy`; irrelevant headless).
+Normal `y` copies to the attached terminal's clipboard via OSC 52. Normal `p`/`P`
+pastes the last text copied/cut inside this Neovim instance, preserving its register
+type (characterwise, linewise, or blockwise) without querying the terminal.
+To paste text newly copied in another Mac app, enter Insert mode and use `Cmd+V`.
+The local cache is per Neovim process; it does not track external clipboard changes.
 
 ## Completion and snippets (Insert mode)
 

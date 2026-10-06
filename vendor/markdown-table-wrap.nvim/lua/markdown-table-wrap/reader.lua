@@ -1,0 +1,1912 @@
+local parser = require("markdown-table-wrap.parser")
+local render = require("markdown-table-wrap.render")
+local mappings = require("markdown-table-wrap.mappings")
+local utf8 = require("markdown-table-wrap.utf8")
+
+local M = {}
+local namespace = vim.api.nvim_create_namespace("markdown-table-wrap-reader")
+local visual_namespace = vim.api.nvim_create_namespace("markdown-table-wrap-reader-visual")
+local states = {}
+local source_states = {}
+local saved_views = {}
+-- Internal layout line objects are read-only. Weak keys release their cached
+-- overlay chunks when Source/layout ownership is dropped; public render APIs
+-- still return independent, freshly built values.
+local display_chunk_cache = setmetatable({}, { __mode = "k" })
+-- Insert mappings close Reader, pause automatic preview, and redeliver an
+-- insert key on Source.  Keep that short-lived pause separate from an
+-- intentional user pause: a late InsertLeave must never resurrect a Reader
+-- after :MarkdownTableDisableAutoPreview, q, or a repeated setup cancelled
+-- the handoff.
+local insert_handoffs = {}
+
+local function notify_error(action, err)
+  vim.notify("MarkdownTableWrap: " .. action .. ": " .. tostring(err), vim.log.levels.ERROR)
+end
+
+function M.cancel_insert_handoff(source_bufnr)
+  local function cancel_one(bufnr)
+    local handoff = insert_handoffs[bufnr]
+    if not handoff then
+      return false
+    end
+    insert_handoffs[bufnr] = nil
+    handoff.cancelled = true
+    -- The mapping owns only a pause it introduced itself.  Callers that need
+    -- an explicit pause cancel the handoff first, then install their pause.
+    if not handoff.was_paused and vim.api.nvim_buf_is_valid(bufnr) then
+      require("markdown-table-wrap").state.paused_buffers[bufnr] = nil
+    end
+    if handoff.autocmd then
+      pcall(vim.api.nvim_del_autocmd, handoff.autocmd)
+    end
+    return true
+  end
+
+  if source_bufnr == nil then
+    local cancelled = false
+    for bufnr in pairs(insert_handoffs) do
+      cancelled = cancel_one(bufnr) or cancelled
+    end
+    return cancelled
+  end
+  return cancel_one(tonumber(source_bufnr))
+end
+
+-- Reader <-> source buffer swaps are internal bookkeeping, not a navigation
+-- the user asked for. nvim_win_set_buf() still records a jump entry for
+-- them (same as `:buffer`), so plain `<C-o>` eventually lands back on the
+-- bare source buffer mid-transition; auto-preview then has to rebuild the
+-- Reader from scratch, which flashes the raw table for a frame. `keepjumps`
+-- keeps these swaps out of the user's jumplist so `<C-o>` only replays real
+-- jumps.
+local function set_win_buf_keepjumps(winid, bufnr)
+  return pcall(function()
+    vim.api.nvim_win_call(winid, function()
+      vim.cmd(("keepjumps buffer %d"):format(bufnr))
+    end)
+  end)
+end
+
+local function normalize_bufnr(bufnr)
+  if not bufnr or bufnr == 0 then
+    return vim.api.nvim_get_current_buf()
+  end
+  return bufnr
+end
+
+local function cell_key(cell)
+  if type(cell) ~= "table" or not cell.table_id or cell.row_index == nil or cell.column_index == nil then
+    return nil
+  end
+  return table.concat({ cell.table_id, cell.row_index, cell.column_index }, ":")
+end
+
+local function build(source_bufnr, config)
+  local source_lines = vim.api.nvim_buf_get_lines(source_bufnr, 0, -1, false)
+  local tables = parser.parse_all_ref(source_bufnr)
+  local output = {}
+  local line_objects = {}
+  local reader_to_source = {}
+  local source_to_reader = {}
+  local table_rows = {}
+  local segments = {}
+  local cell_segments = {}
+  local table_headers = {}
+  local table_index = 1
+  local source_lnum = 1
+
+  local function append(text, mapped_lnum, line_object, is_table)
+    table.insert(output, text)
+    local reader_lnum = #output
+    line_objects[reader_lnum] = line_object or false
+    reader_to_source[reader_lnum] = mapped_lnum
+    source_to_reader[mapped_lnum] = source_to_reader[mapped_lnum] or reader_lnum
+    table_rows[reader_lnum] = is_table == true
+    for _, cell in ipairs(type(line_object) == "table" and line_object.cells or {}) do
+      local key = cell_key(cell)
+      if key then
+        cell_segments[key] = cell_segments[key] or {}
+        table.insert(cell_segments[key], { row = reader_lnum, cell = cell })
+        if line_object.is_header then
+          table_headers[cell.table_id] = table_headers[cell.table_id] or {}
+          table_headers[cell.table_id][reader_lnum] = line_object.text or ""
+        end
+      end
+    end
+  end
+
+  while source_lnum <= #source_lines do
+    local table_info = tables[table_index]
+    if table_info and table_info.start_lnum == source_lnum then
+      local rendered = render.render_table_ref(table_info, config)
+      local reader_start = #output + 1
+
+      for index, text in ipairs(rendered.lines) do
+        local line_object = rendered.line_objects[index]
+        append(text, rendered.source_lnums[index] or table_info.start_lnum, line_object, true)
+      end
+
+      table.insert(segments, {
+        start_row = reader_start - 1,
+        rendered = rendered,
+      })
+      source_lnum = table_info.end_lnum + 1
+      table_index = table_index + 1
+    else
+      append(source_lines[source_lnum] or "", source_lnum, nil, false)
+      source_lnum = source_lnum + 1
+    end
+  end
+
+  if #output == 0 then
+    append("", 1, nil, false)
+  end
+
+  return {
+    lines = output,
+    line_objects = line_objects,
+    reader_to_source = reader_to_source,
+    source_to_reader = source_to_reader,
+    table_rows = table_rows,
+    segments = segments,
+    cell_segments = cell_segments,
+    table_headers = table_headers,
+  }
+end
+
+local function adjust_viewport_for_cursor(source_bufnr, config, source_lnum, source_col)
+  local wide = config and config.wide_table
+  if type(wide) ~= "table" or wide.mode ~= "viewport" then
+    return config
+  end
+  local table_info = parser.parse_at_cursor(source_bufnr, source_lnum)
+  if not table_info then
+    return config
+  end
+  local row = source_lnum == table_info.start_lnum and table_info.header or nil
+  if not row then
+    for _, candidate in ipairs(table_info.rows or {}) do
+      if candidate.source_lnum == source_lnum then
+        row = candidate
+        break
+      end
+    end
+  end
+  for index, cell in ipairs(row or {}) do
+    local span = cell.source_span
+    if
+      span
+      and source_col >= span.start_col
+      and (source_col < span.end_col or (span.start_col == span.end_col and source_col == span.start_col))
+    then
+      return render.ensure_viewport(config, #table_info.header, index)
+    end
+  end
+  return config
+end
+
+local function reader_display_chunks(line_obj, line_index)
+  local cached = display_chunk_cache[line_obj]
+  if cached and cached.index == line_index then
+    return cached.value
+  end
+  local chunks = render.display_chunks(line_obj, line_index)
+  display_chunk_cache[line_obj] = { index = line_index, value = chunks }
+  return chunks
+end
+
+local function apply_table_highlights(reader_bufnr, built, config)
+  require("markdown-table-wrap.theme").ensure(config)
+  vim.api.nvim_buf_clear_namespace(reader_bufnr, namespace, 0, -1)
+  local overlay_priority = math.max(config.overlay_priority or 10000, 10000)
+  for _, segment in ipairs(built.segments) do
+    -- Reader keeps the source filetype so prose can still use normal Markdown
+    -- rendering. Hide only the already-rendered table text and redraw it as an
+    -- authoritative overlay. Otherwise Markdown syntax can pair underscores or
+    -- angle brackets across cells, conceal them, and move the visible borders.
+    -- One extmark owns both concealment and the fully highlighted overlay; a
+    -- second set of range highlights would duplicate work without affecting the
+    -- visible Reader line.
+    for index, line_obj in ipairs(segment.rendered.line_objects) do
+      local row = segment.start_row + index - 1
+      local line = line_obj.text or ""
+      if line ~= "" then
+        vim.api.nvim_buf_set_extmark(reader_bufnr, namespace, row, 0, {
+          end_row = row,
+          end_col = #line,
+          conceal = "",
+          virt_text = reader_display_chunks(line_obj, index),
+          virt_text_pos = "overlay",
+          hl_mode = "replace",
+          right_gravity = false,
+          priority = overlay_priority,
+        })
+      end
+    end
+  end
+end
+
+local function configure_window(winid, config)
+  if not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  local reader_config = config.reader or {}
+  vim.wo[winid].wrap = reader_config.wrap ~= false
+  vim.wo[winid].linebreak = reader_config.linebreak == true
+  vim.wo[winid].breakindent = reader_config.breakindent ~= false
+  vim.wo[winid].conceallevel = math.max(vim.wo[winid].conceallevel, reader_config.conceallevel or 2)
+  vim.wo[winid].concealcursor = reader_config.concealcursor or "nvc"
+end
+
+local function set_reader_keymaps(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return
+  end
+
+  -- Reconfiguration can happen while a logical `vic` session owns temporary
+  -- Visual operators. Restore the user's mappings before replacing the
+  -- Reader's persistent mapping set.
+  require("markdown-table-wrap.cell_ops").clear_visual(reader_bufnr)
+
+  for _, mapping in ipairs(state.installed_mappings or {}) do
+    if type(mapping) == "table" then
+      pcall(vim.keymap.del, mapping.mode or "n", mapping.lhs, { buffer = reader_bufnr })
+    else
+      -- Keep compatibility with state snapshots produced before mode-aware
+      -- cell text-object mappings were introduced.
+      pcall(vim.keymap.del, "n", mapping, { buffer = reader_bufnr })
+    end
+  end
+  state.installed_mappings = {}
+  state.passthrough_fallbacks = {}
+
+  local config = (((state.config or {}).mappings or {}).reader or {})
+  if config.enabled == false then
+    return
+  end
+
+  local function map(lhs, callback, desc, modes)
+    if type(lhs) ~= "string" or lhs == "" then
+      return
+    end
+    modes = modes or "n"
+    vim.keymap.set(modes, lhs, callback, { buffer = reader_bufnr, silent = true, desc = desc })
+    if type(modes) == "table" then
+      for _, mode in ipairs(modes) do
+        table.insert(state.installed_mappings, { mode = mode, lhs = lhs })
+      end
+    else
+      table.insert(state.installed_mappings, { mode = modes, lhs = lhs })
+    end
+  end
+
+  local function edit(keys, pause)
+    return require("markdown-table-wrap.reader").edit(reader_bufnr, keys, pause)
+  end
+
+  map(config.close, function()
+    require("markdown-table-wrap").close_reader()
+  end, "Close Markdown table reader")
+
+  map(config.edit, function()
+    edit(nil, true)
+  end, "Edit Markdown source")
+
+  for _, command in ipairs({ { config.undo, "u" }, { config.redo, "<C-r>" } }) do
+    local lhs, native = command[1], command[2]
+    map(lhs, function()
+      local count = vim.v.count > 0 and tostring(vim.v.count) or ""
+      local source = M.close(reader_bufnr, { preserve_view = true })
+      if source and vim.api.nvim_get_current_buf() == source then
+        -- Source owns history and its own mappings. Put the key before the
+        -- remaining typeahead; normal policy may rebuild Reader afterwards.
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(count .. native, true, false, true), "im", false)
+      end
+    end, "Source " .. (native == "u" and "undo" or "redo"))
+  end
+
+  for _, key in ipairs(config.insert or {}) do
+    map(key, function()
+      local source_bufnr = state.source_bufnr
+      local plugin = require("markdown-table-wrap")
+      M.cancel_insert_handoff(source_bufnr)
+      local was_paused = source_bufnr and plugin.state.paused_buffers[source_bufnr] == true
+      if not edit(nil, true) then
+        return
+      end
+
+      -- The pause above stops auto-preview from racing the key
+      -- redelivery and reopening Reader mid-keystroke (it would otherwise
+      -- yank the buffer out from under the pending insert).  This callback is
+      -- deliberately cancellable: q/disable/setup may establish a newer
+      -- policy before InsertLeave, and an existing explicit pause is not ours
+      -- to undo.
+      if
+        source_bufnr
+        and vim.api.nvim_buf_is_loaded(source_bufnr)
+        and vim.api.nvim_get_current_buf() == source_bufnr
+      then
+        local handoff = { was_paused = was_paused }
+        insert_handoffs[source_bufnr] = handoff
+        handoff.autocmd = vim.api.nvim_create_autocmd("InsertLeave", {
+          buffer = source_bufnr,
+          once = true,
+          callback = function(args)
+            if insert_handoffs[source_bufnr] ~= handoff then
+              return
+            end
+            insert_handoffs[source_bufnr] = nil
+            if
+              handoff.cancelled
+              or handoff.was_paused
+              or args.buf ~= source_bufnr
+              or not vim.api.nvim_buf_is_valid(source_bufnr)
+            then
+              return
+            end
+
+            local current_config = plugin.get_buffer_config(source_bufnr)
+            -- Do not use a forced refresh to opt a buffer back into automatic
+            -- Reader mode.  The temporary pause is released, but an explicit
+            -- auto=false policy leaves Source visible.
+            if current_config.auto_preview ~= true then
+              plugin.state.paused_buffers[source_bufnr] = nil
+              return
+            end
+            plugin.state.paused_buffers[source_bufnr] = nil
+            plugin.schedule_refresh({ bufnr = source_bufnr })
+          end,
+        })
+        -- Put the native insert key before any already-typed text. Scheduling
+        -- it later lets a fast `iTEXT<Esc>` execute TEXT as Normal commands.
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "in", false)
+      elseif source_bufnr and not was_paused then
+        plugin.state.paused_buffers[source_bufnr] = nil
+      end
+    end, "Edit Markdown source")
+  end
+
+  map(config.open_link, function()
+    local reader = require("markdown-table-wrap.reader")
+    local opened, handled = reader.open_link(reader_bufnr, { silent = true })
+    if opened or handled then
+      return
+    end
+
+    local state = states[reader_bufnr]
+    local position = require("markdown-table-wrap.reader").source_position(reader_bufnr)
+    if
+      state
+      and mappings.invoke(state.gx_fallback, {
+        native_gx = true,
+        context_bufnr = state.source_bufnr,
+        cursor = position and { position[2], position[3] } or nil,
+      })
+    then
+      return
+    end
+
+    vim.notify("MarkdownTableWrap: no link target or gx fallback is available.", vim.log.levels.INFO)
+  end, "Open rendered Markdown table link")
+
+  map(config.help, function()
+    require("markdown-table-wrap.actions").run("help", { bufnr = reader_bufnr })
+  end, "Show Markdown table reader help")
+
+  map(config.copy_cell, function()
+    require("markdown-table-wrap.export").cell({ bufnr = reader_bufnr })
+  end, "Copy rendered Markdown table cell")
+
+  map(config.copy_table, function()
+    require("markdown-table-wrap.export").table({ bufnr = reader_bufnr })
+  end, "Copy rendered Markdown table")
+
+  require("markdown-table-wrap.cell_ops").install(function(lhs, callback, description, modes)
+    map(lhs, callback, description, modes)
+  end, reader_bufnr, state)
+
+  for lhs, spec in pairs(config.passthrough or {}) do
+    local passthrough_lhs = lhs
+    local passthrough_spec = spec
+    state.passthrough_fallbacks[passthrough_lhs] = mappings.get(state.source_bufnr, passthrough_lhs, "n")
+    map(passthrough_lhs, function()
+      require("markdown-table-wrap.actions").passthrough(reader_bufnr, passthrough_lhs, passthrough_spec)
+    end, "Markdown table reader passthrough")
+  end
+end
+
+local function acquire_source(source_bufnr, reader_bufnr)
+  local source_state = source_states[source_bufnr]
+  if not source_state then
+    source_state = {
+      original_bufhidden = vim.bo[source_bufnr].bufhidden,
+      readers = {},
+    }
+    source_states[source_bufnr] = source_state
+  end
+
+  source_state.readers[reader_bufnr] = true
+  vim.bo[source_bufnr].bufhidden = "hide"
+  return source_state.original_bufhidden
+end
+
+local function release_source(state, reader_bufnr)
+  local source_bufnr = state and state.source_bufnr
+  local source_state = source_bufnr and source_states[source_bufnr] or nil
+  if not source_state then
+    return
+  end
+
+  source_state.readers[reader_bufnr] = nil
+  if next(source_state.readers) ~= nil then
+    return
+  end
+
+  if vim.api.nvim_buf_is_valid(source_bufnr) then
+    vim.bo[source_bufnr].bufhidden = source_state.original_bufhidden or ""
+  end
+  source_states[source_bufnr] = nil
+end
+
+local function restore_window(state)
+  local winid = state and state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+
+  for option, value in pairs(state.source_options or {}) do
+    vim.wo[winid][option] = value
+  end
+end
+
+local function create_reader_buffer(source_bufnr)
+  local reader_bufnr = vim.api.nvim_create_buf(false, true)
+  local configured, configure_error = pcall(function()
+    vim.b[reader_bufnr].markdown_table_wrap_reader = true
+    vim.b[reader_bufnr].markdown_table_wrap_source = source_bufnr
+    -- acwrite lets :write save the backing Markdown buffer while
+    -- modifiable=false continues to protect the rendered view from direct
+    -- edits.
+    vim.bo[reader_bufnr].buftype = "acwrite"
+    vim.bo[reader_bufnr].bufhidden = "hide"
+    vim.bo[reader_bufnr].swapfile = false
+    vim.bo[reader_bufnr].undofile = false
+    vim.bo[reader_bufnr].modifiable = true
+
+    require("markdown-table-wrap.reader_io").attach(reader_bufnr, source_bufnr)
+
+    vim.bo[reader_bufnr].filetype = vim.bo[source_bufnr].filetype
+    vim.api.nvim_create_autocmd("BufWinLeave", {
+      buffer = reader_bufnr,
+      callback = function()
+        require("markdown-table-wrap.reader").sync_view(reader_bufnr)
+      end,
+    })
+    vim.api.nvim_create_autocmd("BufHidden", {
+      buffer = reader_bufnr,
+      once = true,
+      callback = function()
+        require("markdown-table-wrap.reader").abandon(reader_bufnr)
+      end,
+    })
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      buffer = reader_bufnr,
+      once = true,
+      callback = function()
+        require("markdown-table-wrap.reader").cleanup(reader_bufnr)
+      end,
+    })
+  end)
+  if not configured then
+    if vim.api.nvim_buf_is_valid(reader_bufnr) then
+      pcall(vim.api.nvim_buf_delete, reader_bufnr, { force = true })
+    end
+    error(configure_error)
+  end
+  return reader_bufnr
+end
+
+local function source_cursor_for(state, reader_lnum, reader_col)
+  local source_lnum = state.reader_to_source[reader_lnum] or 1
+  local source_line = vim.api.nvim_buf_get_lines(state.source_bufnr, source_lnum - 1, source_lnum, false)[1] or ""
+  local source_col = math.min(reader_col, #source_line)
+  if state.table_rows[reader_lnum] then
+    source_col = 0
+    local line_object = state.line_objects[reader_lnum]
+    for _, cell in ipairs(type(line_object) == "table" and line_object.cells or {}) do
+      if reader_col >= cell.start_col and reader_col < cell.end_col then
+        local span = cell.source_span or require("markdown-table-wrap.nav").spans(source_line)[cell.index]
+        source_col = span and span.start_col or 0
+        break
+      end
+    end
+  end
+  return source_lnum, source_col
+end
+
+local view_keys = { "lnum", "col", "curswant", "topline", "topfill", "leftcol", "skipcol" }
+
+local function copy_view(view)
+  local result = {}
+  for _, key in ipairs(view_keys) do
+    if view and view[key] ~= nil then
+      result[key] = view[key]
+    end
+  end
+  return result
+end
+
+local function save_view(source_bufnr, winid, snapshot)
+  if not source_bufnr or not winid or not snapshot then
+    return
+  end
+  saved_views[source_bufnr] = saved_views[source_bufnr] or {}
+  saved_views[source_bufnr][winid] = snapshot
+end
+
+local function get_saved_view(source_bufnr, winid)
+  local by_win = saved_views[source_bufnr]
+  return by_win and by_win[winid] or nil
+end
+
+local function clear_saved_view(source_bufnr, winid)
+  local by_win = saved_views[source_bufnr]
+  if not by_win then
+    return
+  end
+  if not winid then
+    saved_views[source_bufnr] = nil
+    return
+  end
+  by_win[winid] = nil
+  if next(by_win) == nil then
+    saved_views[source_bufnr] = nil
+  end
+end
+
+local function snapshot_is_current(snapshot, source_bufnr)
+  return snapshot
+    and vim.api.nvim_buf_is_valid(source_bufnr)
+    and snapshot.source_changedtick == vim.api.nvim_buf_get_changedtick(source_bufnr)
+end
+
+local function views_match(left, right)
+  if type(left) ~= "table" or type(right) ~= "table" then
+    return false
+  end
+  for _, key in ipairs({ "lnum", "col", "topline", "topfill", "leftcol", "skipcol" }) do
+    if (tonumber(left[key]) or 0) ~= (tonumber(right[key]) or 0) then
+      return false
+    end
+  end
+  return true
+end
+
+local function window_view(winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return nil
+  end
+  local ok, view = pcall(vim.api.nvim_win_call, winid, function()
+    return vim.fn.winsaveview()
+  end)
+  return ok and type(view) == "table" and view or nil
+end
+
+local function reader_winid(state, reader_bufnr)
+  local winid = state and state.winid
+  if winid and vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == reader_bufnr then
+    return winid
+  end
+  return vim.fn.win_findbuf(reader_bufnr)[1]
+end
+
+local function wrap_offset(mapping, reader_lnum, source_lnum)
+  local first = mapping and mapping[source_lnum]
+  if not first then
+    return 0
+  end
+  return math.max(0, (tonumber(reader_lnum) or first) - first)
+end
+
+local function capture_view(reader_bufnr, winid)
+  local state = states[reader_bufnr]
+  if not state or not vim.api.nvim_buf_is_valid(state.source_bufnr) then
+    return nil
+  end
+  winid = winid or reader_winid(state, reader_bufnr)
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    return nil
+  end
+  local view = window_view(winid)
+  if not view then
+    return nil
+  end
+  local source_lnum, source_col = source_cursor_for(state, view.lnum, view.col)
+  local source_topline = state.reader_to_source[view.topline] or source_lnum
+  return {
+    winid = winid,
+    source_changedtick = vim.api.nvim_buf_get_changedtick(state.source_bufnr),
+    source_lnum = source_lnum,
+    source_col = source_col,
+    source_topline = source_topline,
+    cursor_offset = wrap_offset(state.source_to_reader, view.lnum, source_lnum),
+    topline_offset = wrap_offset(state.source_to_reader, view.topline, source_topline),
+    reader_col = view.col,
+    reader_view = copy_view(view),
+  }
+end
+
+local function clamp_lnum(bufnr, lnum)
+  return math.max(1, math.min(tonumber(lnum) or 1, vim.api.nvim_buf_line_count(bufnr)))
+end
+
+local function apply_source_view(source_bufnr, winid, snapshot)
+  if
+    not snapshot_is_current(snapshot, source_bufnr)
+    or not winid
+    or not vim.api.nvim_win_is_valid(winid)
+    or vim.api.nvim_win_get_buf(winid) ~= source_bufnr
+  then
+    return false
+  end
+  local lnum = clamp_lnum(source_bufnr, snapshot.source_lnum)
+  local topline = math.min(lnum, clamp_lnum(source_bufnr, snapshot.source_topline))
+  local line = vim.api.nvim_buf_get_lines(source_bufnr, lnum - 1, lnum, false)[1] or ""
+  local view = copy_view(snapshot.reader_view)
+  view.lnum = lnum
+  view.col = math.max(0, math.min(tonumber(snapshot.source_col) or 0, #line))
+  view.topline = topline
+  local ok = pcall(vim.api.nvim_win_call, winid, function()
+    vim.fn.winrestview(view)
+  end)
+  if ok then
+    snapshot.applied_source_view = copy_view(window_view(winid))
+  end
+  return ok
+end
+
+local function last_reader_line_for_source(built, source_lnum)
+  local first = built.source_to_reader[source_lnum]
+  if not first then
+    return nil
+  end
+  local last = first
+  for reader_lnum = first + 1, #(built.lines or {}) do
+    if built.reader_to_source[reader_lnum] ~= source_lnum then
+      break
+    end
+    last = reader_lnum
+  end
+  return last
+end
+
+local function map_source_line(built, source_lnum, offset)
+  local first = built.source_to_reader[source_lnum]
+  if not first then
+    return math.max(1, math.min(tonumber(source_lnum) or 1, #(built.lines or {})))
+  end
+  local last = last_reader_line_for_source(built, source_lnum) or first
+  return math.max(first, math.min(first + (tonumber(offset) or 0), last))
+end
+
+local function apply_reader_view(winid, built, snapshot)
+  if not snapshot or not winid or not vim.api.nvim_win_is_valid(winid) then
+    return false
+  end
+  local lnum = map_source_line(built, snapshot.source_lnum, snapshot.cursor_offset)
+  local topline = map_source_line(built, snapshot.source_topline, snapshot.topline_offset)
+  topline = math.min(lnum, topline)
+  local line = built.lines[lnum] or ""
+  local view = copy_view(snapshot.reader_view)
+  view.lnum = lnum
+  view.col = math.max(0, math.min(tonumber(snapshot.reader_col) or 0, #line))
+  view.topline = topline
+  return pcall(vim.api.nvim_win_call, winid, function()
+    vim.fn.winrestview(view)
+  end)
+end
+
+function M.sync_view(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or state.closing then
+    return false
+  end
+  local snapshot = capture_view(reader_bufnr)
+  if not snapshot then
+    return false
+  end
+  save_view(state.source_bufnr, snapshot.winid, snapshot)
+  return true
+end
+
+function M.restore_source_view(source_bufnr, winid)
+  source_bufnr = normalize_bufnr(source_bufnr)
+  winid = tonumber(winid) or vim.api.nvim_get_current_win()
+  local snapshot = get_saved_view(source_bufnr, winid)
+  if not snapshot_is_current(snapshot, source_bufnr) then
+    clear_saved_view(source_bufnr, winid)
+    return false
+  end
+  if snapshot.applied_source_view then
+    return false
+  end
+  return apply_source_view(source_bufnr, winid, snapshot)
+end
+
+function M.invalidate_source_view(source_bufnr, winid)
+  source_bufnr = normalize_bufnr(source_bufnr)
+  local by_win = saved_views[source_bufnr]
+  if not by_win then
+    return false
+  end
+  if not winid then
+    if not vim.api.nvim_buf_is_valid(source_bufnr) then
+      saved_views[source_bufnr] = nil
+      return true
+    end
+    local tick = vim.api.nvim_buf_get_changedtick(source_bufnr)
+    local cleared = false
+    for saved_winid, snapshot in pairs(by_win) do
+      if snapshot.source_changedtick ~= tick then
+        by_win[saved_winid] = nil
+        cleared = true
+      end
+    end
+    if next(by_win) == nil then
+      saved_views[source_bufnr] = nil
+    end
+    return cleared
+  end
+  winid = tonumber(winid)
+  local snapshot = by_win[winid]
+  if not snapshot_is_current(snapshot, source_bufnr) then
+    clear_saved_view(source_bufnr, winid)
+    return snapshot ~= nil
+  end
+  if
+    snapshot.applied_source_view
+    and vim.api.nvim_win_is_valid(winid)
+    and vim.api.nvim_win_get_buf(winid) == source_bufnr
+    and not views_match(window_view(winid), snapshot.applied_source_view)
+  then
+    clear_saved_view(source_bufnr, winid)
+    return true
+  end
+  return false
+end
+
+function M.clear_saved_views(source_bufnr, winid)
+  source_bufnr = tonumber(source_bufnr)
+  winid = tonumber(winid)
+  if source_bufnr then
+    clear_saved_view(source_bufnr, winid)
+    return
+  end
+  if not winid then
+    saved_views = {}
+    return
+  end
+  for bufnr, by_win in pairs(saved_views) do
+    by_win[winid] = nil
+    if next(by_win) == nil then
+      saved_views[bufnr] = nil
+    end
+  end
+end
+
+function M.is_reader(bufnr)
+  bufnr = normalize_bufnr(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  return states[bufnr] ~= nil or vim.b[bufnr].markdown_table_wrap_reader == true
+end
+
+function M.source_bufnr(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  if not vim.api.nvim_buf_is_valid(reader_bufnr) then
+    return nil
+  end
+  local state = states[reader_bufnr]
+  return state and state.source_bufnr or vim.b[reader_bufnr].markdown_table_wrap_source
+end
+
+function M.source_changedtick(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or not vim.api.nvim_buf_is_valid(state.source_bufnr) then
+    return nil
+  end
+  return state.source_changedtick
+end
+
+function M.open(source_bufnr, config)
+  source_bufnr = normalize_bufnr(source_bufnr)
+  if not vim.api.nvim_buf_is_valid(source_bufnr) or M.is_reader(source_bufnr) then
+    return nil
+  end
+
+  local winid = vim.api.nvim_get_current_win()
+  local saved = get_saved_view(source_bufnr, winid)
+  if saved and not snapshot_is_current(saved, source_bufnr) then
+    clear_saved_view(source_bufnr, winid)
+    saved = nil
+  end
+  if saved and not saved.applied_source_view then
+    apply_source_view(source_bufnr, winid, saved)
+  end
+  if saved and not views_match(window_view(winid), saved.applied_source_view) then
+    clear_saved_view(source_bufnr, winid)
+    saved = nil
+  end
+  local source_view = window_view(winid)
+  local source_cursor = vim.api.nvim_win_get_cursor(winid)
+  local target_view = saved
+    or {
+      source_changedtick = vim.api.nvim_buf_get_changedtick(source_bufnr),
+      source_lnum = source_cursor[1],
+      source_col = source_cursor[2],
+      source_topline = source_view and source_view.topline or source_cursor[1],
+      cursor_offset = 0,
+      topline_offset = 0,
+      reader_col = source_cursor[2],
+      reader_view = copy_view(source_view),
+    }
+  local source_alt_bufnr = vim.fn.bufnr("#")
+  local source_options = {
+    wrap = vim.wo[winid].wrap,
+    linebreak = vim.wo[winid].linebreak,
+    breakindent = vim.wo[winid].breakindent,
+    conceallevel = vim.wo[winid].conceallevel,
+    concealcursor = vim.wo[winid].concealcursor,
+    winbar = vim.wo[winid].winbar,
+  }
+  local built_ok, adjusted_or_error, built = pcall(function()
+    local adjusted = adjust_viewport_for_cursor(source_bufnr, config, source_cursor[1], source_cursor[2])
+    return adjusted, build(source_bufnr, adjusted)
+  end)
+  if not built_ok then
+    notify_error("could not build Reader", adjusted_or_error)
+    return nil
+  end
+  config = adjusted_or_error
+
+  local reader_bufnr
+  local ownership = { source_bufnr = source_bufnr }
+  local prepared, prepare_error = pcall(function()
+    reader_bufnr = create_reader_buffer(source_bufnr)
+    ownership.source_bufhidden = acquire_source(source_bufnr, reader_bufnr)
+    vim.api.nvim_buf_set_lines(reader_bufnr, 0, -1, false, built.lines)
+    apply_table_highlights(reader_bufnr, built, config)
+    vim.bo[reader_bufnr].modifiable = false
+    vim.bo[reader_bufnr].readonly = false
+    vim.bo[reader_bufnr].modified = vim.bo[source_bufnr].modified
+
+    states[reader_bufnr] = vim.tbl_extend("force", built, {
+      source_bufnr = source_bufnr,
+      source_changedtick = vim.api.nvim_buf_get_changedtick(source_bufnr),
+      text_area_width = render.text_area_width(winid),
+      config = config,
+      winid = winid,
+      source_options = source_options,
+      source_bufhidden = ownership.source_bufhidden,
+      source_alt_bufnr = source_alt_bufnr > 0 and source_alt_bufnr or nil,
+      gx_fallback = mappings.get(source_bufnr, "gx", "n"),
+    })
+    set_reader_keymaps(reader_bufnr)
+  end)
+  if not prepared then
+    if reader_bufnr then
+      states[reader_bufnr] = nil
+      release_source(ownership, reader_bufnr)
+      if vim.api.nvim_buf_is_valid(reader_bufnr) then
+        pcall(vim.api.nvim_buf_delete, reader_bufnr, { force = true })
+      end
+    end
+    notify_error("could not prepare Reader", prepare_error)
+    return nil
+  end
+
+  local switched, switch_err = set_win_buf_keepjumps(winid, reader_bufnr)
+  if not switched then
+    release_source(states[reader_bufnr], reader_bufnr)
+    states[reader_bufnr] = nil
+    pcall(vim.api.nvim_buf_delete, reader_bufnr, { force = true })
+    notify_error("could not open Reader", switch_err)
+    return nil
+  end
+  local finalized, finalize_error = pcall(function()
+    configure_window(winid, config)
+    if not apply_reader_view(winid, built, target_view) then
+      local reader_lnum = built.source_to_reader[source_cursor[1]] or 1
+      local reader_line = built.lines[reader_lnum] or ""
+      vim.api.nvim_win_set_cursor(winid, { reader_lnum, math.min(source_cursor[2], #reader_line) })
+    end
+    M.update_sticky_header(reader_bufnr, winid)
+  end)
+  if not finalized then
+    local state = states[reader_bufnr]
+    if
+      vim.api.nvim_win_is_valid(winid)
+      and vim.api.nvim_win_get_buf(winid) == reader_bufnr
+      and vim.api.nvim_buf_is_valid(source_bufnr)
+    then
+      set_win_buf_keepjumps(winid, source_bufnr)
+    end
+    restore_window(state)
+    states[reader_bufnr] = nil
+    release_source(state or ownership, reader_bufnr)
+    if vim.api.nvim_buf_is_valid(reader_bufnr) then
+      pcall(vim.api.nvim_buf_delete, reader_bufnr, { force = true })
+    end
+    notify_error("could not finalize Reader", finalize_error)
+    return nil
+  end
+  local event_data = {
+    mode = "reader",
+    source_bufnr = source_bufnr,
+    view_bufnr = reader_bufnr,
+    winid = winid,
+  }
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapReaderEnter", event_data)
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapViewChanged", event_data)
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapRendered", event_data)
+  clear_saved_view(source_bufnr, winid)
+  return reader_bufnr
+end
+
+function M.close(reader_bufnr, opts)
+  opts = opts or {}
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or not vim.api.nvim_buf_is_loaded(state.source_bufnr) then
+    return nil
+  end
+
+  local winid = opts.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    winid = state.winid
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    winid = vim.fn.win_findbuf(reader_bufnr)[1]
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    M.abandon(reader_bufnr)
+    return state.source_bufnr
+  end
+
+  local snapshot = capture_view(reader_bufnr, winid)
+  local reader_cursor = vim.api.nvim_win_get_cursor(winid)
+  local source_lnum, source_col = source_cursor_for(state, reader_cursor[1], reader_cursor[2])
+  -- The Reader mirrors source's modified flag so :x and ZZ save correctly.
+  -- Clear only the disposable mirror before switching away from this view.
+  vim.bo[reader_bufnr].modified = false
+  state.closing = true
+  M.clear_visual_selection(reader_bufnr)
+  local switched, switch_err = set_win_buf_keepjumps(winid, state.source_bufnr)
+  if not switched then
+    state.closing = false
+    vim.bo[reader_bufnr].modified = vim.bo[state.source_bufnr].modified
+    vim.notify("MarkdownTableWrap: could not restore source: " .. tostring(switch_err), vim.log.levels.ERROR)
+    return nil
+  end
+
+  restore_window(state)
+  if not apply_source_view(state.source_bufnr, winid, snapshot) then
+    vim.api.nvim_win_set_cursor(winid, { source_lnum, source_col })
+  end
+  if opts.preserve_view and snapshot then
+    save_view(state.source_bufnr, winid, snapshot)
+  else
+    clear_saved_view(state.source_bufnr, winid)
+  end
+
+  states[reader_bufnr] = nil
+  release_source(state, reader_bufnr)
+  local event_data = {
+    mode = "source",
+    source_bufnr = state.source_bufnr,
+    view_bufnr = state.source_bufnr,
+    previous_view_bufnr = reader_bufnr,
+    winid = winid,
+  }
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapReaderLeave", event_data)
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapViewChanged", event_data)
+  if vim.api.nvim_buf_is_valid(reader_bufnr) then
+    vim.api.nvim_buf_delete(reader_bufnr, { force = true })
+  end
+  return state.source_bufnr
+end
+
+function M.edit(reader_bufnr, keys, pause)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local source_bufnr = M.close(reader_bufnr)
+  if not source_bufnr then
+    return false
+  end
+
+  if pause then
+    require("markdown-table-wrap").pause_buffer(source_bufnr)
+  end
+
+  if keys and keys ~= "" then
+    local encoded = vim.api.nvim_replace_termcodes(keys, true, false, true)
+    vim.schedule(function()
+      -- The redelivered key belongs to the Source window that just replaced
+      -- Reader.  If a close/navigation/cancellation won that race, never
+      -- insert into whichever buffer became current and release our temporary
+      -- handoff state instead.
+      if not vim.api.nvim_buf_is_valid(source_bufnr) or vim.api.nvim_get_current_buf() ~= source_bufnr then
+        M.cancel_insert_handoff(source_bufnr)
+        return
+      end
+      vim.api.nvim_feedkeys(encoded, "n", false)
+    end)
+  end
+  return true
+end
+
+function M.write(reader_bufnr, opts)
+  return require("markdown-table-wrap.reader_io").write(normalize_bufnr(reader_bufnr), opts)
+end
+
+function M.source_range(reader_bufnr, first, last)
+  local state = states[normalize_bufnr(reader_bufnr)]
+  if not state or not first or not last or first < 1 or last < first or last > #state.reader_to_source then
+    return nil
+  end
+  local low, high = math.huge, 0
+  for row = first, last do
+    local source_row = state.reader_to_source[row]
+    low, high = math.min(low, source_row), math.max(high, source_row)
+  end
+  return { low, high }
+end
+
+function M.refresh(reader_bufnr, opts)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or not vim.api.nvim_buf_is_valid(state.source_bufnr) then
+    return false
+  end
+  require("markdown-table-wrap.reader_io").rename(reader_bufnr, state.source_bufnr)
+
+  local winid = state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    winid = vim.fn.win_findbuf(reader_bufnr)[1]
+    state.winid = winid
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return false
+  end
+
+  local text_area_width = render.text_area_width(winid)
+  if
+    opts
+    and opts.if_changed
+    and state.text_area_width == text_area_width
+    and state.source_changedtick == vim.api.nvim_buf_get_changedtick(state.source_bufnr)
+    and vim.bo[reader_bufnr].modified == vim.bo[state.source_bufnr].modified
+  then
+    -- Height-only/no-op resize events cannot affect table layout. Explicit
+    -- refreshes and option/configuration changes retain their forced behavior.
+    return false
+  end
+
+  M.clear_visual_selection(reader_bufnr)
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local source_lnum = state.reader_to_source[cursor[1]] or 1
+  local source_col = select(2, source_cursor_for(state, cursor[1], cursor[2]))
+  local built_ok, next_config_or_error, built = pcall(function()
+    local candidate_config = vim.deepcopy(state.config)
+    local next_config = adjust_viewport_for_cursor(state.source_bufnr, candidate_config, source_lnum, source_col)
+    return next_config,
+      vim.api.nvim_win_call(winid, function()
+        return build(state.source_bufnr, next_config)
+      end)
+  end)
+  if not built_ok then
+    notify_error("could not rebuild Reader", next_config_or_error)
+    return false
+  end
+  local next_config = next_config_or_error
+
+  local applied, apply_error = pcall(function()
+    vim.bo[reader_bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(reader_bufnr, 0, -1, false, built.lines)
+    apply_table_highlights(reader_bufnr, built, next_config)
+  end)
+  if vim.api.nvim_buf_is_valid(reader_bufnr) then
+    vim.bo[reader_bufnr].modifiable = false
+    vim.bo[reader_bufnr].readonly = false
+    if vim.api.nvim_buf_is_valid(state.source_bufnr) then
+      vim.bo[reader_bufnr].modified = vim.bo[state.source_bufnr].modified
+    end
+  end
+  if not applied or states[reader_bufnr] ~= state then
+    if vim.api.nvim_buf_is_valid(reader_bufnr) and states[reader_bufnr] == state then
+      pcall(function()
+        vim.bo[reader_bufnr].modifiable = true
+        vim.api.nvim_buf_set_lines(reader_bufnr, 0, -1, false, state.lines or { "" })
+        apply_table_highlights(reader_bufnr, state, state.config)
+      end)
+      if vim.api.nvim_buf_is_valid(reader_bufnr) then
+        vim.bo[reader_bufnr].modifiable = false
+        vim.bo[reader_bufnr].readonly = false
+        if vim.api.nvim_buf_is_valid(state.source_bufnr) then
+          vim.bo[reader_bufnr].modified = vim.bo[state.source_bufnr].modified
+        end
+      end
+    end
+    notify_error("could not update Reader projection", apply_error or "Reader state changed during refresh")
+    return false
+  end
+
+  for key, value in pairs(built) do
+    state[key] = value
+  end
+  state.config = next_config
+  state.source_changedtick = vim.api.nvim_buf_get_changedtick(state.source_bufnr)
+  state.text_area_width = text_area_width
+
+  local finalized, finalize_error = pcall(function()
+    configure_window(winid, state.config)
+    local reader_lnum = state.source_to_reader[source_lnum] or 1
+    local line = state.lines[reader_lnum] or ""
+    vim.api.nvim_win_set_cursor(winid, { reader_lnum, math.min(cursor[2], #line) })
+    M.update_sticky_header(reader_bufnr, winid)
+  end)
+  if not finalized then
+    notify_error("could not finalize Reader refresh", finalize_error)
+    return false
+  end
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapRendered", {
+    mode = "reader",
+    source_bufnr = state.source_bufnr,
+    view_bufnr = reader_bufnr,
+    winid = winid,
+  })
+  return true
+end
+
+function M.reconfigure(reader_bufnr, config)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return false
+  end
+
+  state.config = config
+  state.gx_fallback = mappings.get(state.source_bufnr, "gx", "n")
+  set_reader_keymaps(reader_bufnr)
+  if #vim.fn.win_findbuf(reader_bufnr) == 0 then
+    return true
+  end
+  return M.refresh(reader_bufnr)
+end
+
+function M.has_source_readers(source_bufnr)
+  source_bufnr = normalize_bufnr(source_bufnr)
+  local source_state = source_states[source_bufnr]
+  return source_state ~= nil and next(source_state.readers) ~= nil
+end
+
+function M.refresh_source(source_bufnr)
+  source_bufnr = normalize_bufnr(source_bufnr)
+  local source_state = source_states[source_bufnr]
+  if not source_state then
+    return 0
+  end
+
+  local refreshed = 0
+  local changedtick = vim.api.nvim_buf_is_valid(source_bufnr) and vim.api.nvim_buf_get_changedtick(source_bufnr) or nil
+  for reader_bufnr in pairs(source_state.readers) do
+    if states[reader_bufnr] and changedtick and vim.api.nvim_buf_is_valid(reader_bufnr) then
+      require("markdown-table-wrap.reader_io").rename(reader_bufnr, source_bufnr)
+      vim.bo[reader_bufnr].modified = vim.bo[source_bufnr].modified
+    end
+    if
+      states[reader_bufnr]
+      and changedtick
+      and states[reader_bufnr].source_changedtick ~= changedtick
+      and M.refresh(reader_bufnr)
+    then
+      refreshed = refreshed + 1
+    end
+  end
+  return refreshed
+end
+
+function M.refresh_windows(winids, opts)
+  local selected
+  if type(winids) == "table" then
+    selected = {}
+    for _, winid in ipairs(winids) do
+      winid = tonumber(winid)
+      if winid then
+        selected[winid] = true
+      end
+    end
+  end
+
+  local targets = {}
+  for reader_bufnr, state in pairs(states) do
+    local winid = state.winid
+    if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+      winid = vim.fn.win_findbuf(reader_bufnr)[1]
+      state.winid = winid
+    end
+    if winid and vim.api.nvim_win_is_valid(winid) and (not selected or selected[winid]) then
+      table.insert(targets, reader_bufnr)
+    end
+  end
+  table.sort(targets)
+
+  local refreshed = 0
+  for _, reader_bufnr in ipairs(targets) do
+    if M.refresh(reader_bufnr, opts) then
+      refreshed = refreshed + 1
+    end
+  end
+  return refreshed
+end
+
+function M.open_link(reader_bufnr, opts)
+  opts = opts or {}
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  if not states[reader_bufnr] then
+    return false
+  end
+  local context = require("markdown-table-wrap.context").resolve({ bufnr = reader_bufnr })
+  if not context then
+    return false, false
+  end
+  return require("markdown-table-wrap.links").open_at_context(context, opts)
+end
+
+function M.abandon(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or state.closing then
+    return false
+  end
+
+  M.sync_view(reader_bufnr)
+
+  if vim.api.nvim_buf_is_valid(reader_bufnr) then
+    M.clear_visual_selection(reader_bufnr)
+    vim.bo[reader_bufnr].modified = false
+    vim.b[reader_bufnr].markdown_table_wrap_reader = nil
+    vim.b[reader_bufnr].markdown_table_wrap_source = nil
+    vim.b[reader_bufnr].markdown_table_wrap_auxiliary = true
+  end
+  restore_window(state)
+  states[reader_bufnr] = nil
+  release_source(state, reader_bufnr)
+  local event_data = {
+    mode = "source",
+    source_bufnr = state.source_bufnr,
+    view_bufnr = state.source_bufnr,
+    previous_view_bufnr = reader_bufnr,
+    winid = state.winid,
+    implicit = true,
+  }
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapReaderLeave", event_data)
+  require("markdown-table-wrap.events").emit("MarkdownTableWrapViewChanged", event_data)
+
+  if vim.api.nvim_buf_is_valid(reader_bufnr) then
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(reader_bufnr) then
+        pcall(vim.api.nvim_buf_delete, reader_bufnr, { force = true })
+      end
+    end)
+  end
+  return true
+end
+
+function M.cleanup(reader_bufnr)
+  M.cancel_insert_handoff(reader_bufnr)
+  clear_saved_view(reader_bufnr)
+  local state = states[reader_bufnr]
+  if state then
+    M.clear_visual_selection(reader_bufnr)
+    restore_window(state)
+    states[reader_bufnr] = nil
+    release_source(state, reader_bufnr)
+    return
+  end
+
+  local source_state = source_states[reader_bufnr]
+  if source_state then
+    local readers = vim.tbl_keys(source_state.readers)
+    if vim.api.nvim_buf_is_valid(reader_bufnr) then
+      vim.bo[reader_bufnr].bufhidden = source_state.original_bufhidden or ""
+    end
+    source_states[reader_bufnr] = nil
+    local replacement
+    for _, dependent in ipairs(readers) do
+      local dependent_bufnr = dependent
+      local dependent_state = states[dependent_bufnr]
+      M.clear_visual_selection(dependent_bufnr)
+      restore_window(dependent_state)
+      states[dependent_bufnr] = nil
+      if vim.api.nvim_buf_is_valid(dependent_bufnr) then
+        vim.bo[dependent_bufnr].modified = false
+        vim.b[dependent_bufnr].markdown_table_wrap_reader = nil
+        vim.b[dependent_bufnr].markdown_table_wrap_source = nil
+        vim.b[dependent_bufnr].markdown_table_wrap_auxiliary = true
+        vim.schedule(function()
+          if vim.api.nvim_buf_is_valid(dependent_bufnr) then
+            -- A document close must not delete its readers' split windows.
+            -- Pick another real buffer after the Source deletion has finished.
+            for _, winid in ipairs(vim.fn.win_findbuf(dependent_bufnr)) do
+              if not replacement or not vim.api.nvim_buf_is_valid(replacement) then
+                replacement = nil
+                local candidates = vim.fn.getbufinfo({ buflisted = 1 })
+                table.sort(candidates, function(a, b)
+                  return a.lastused > b.lastused
+                end)
+                for _, candidate in ipairs(candidates) do
+                  if
+                    candidate.bufnr ~= reader_bufnr
+                    and not M.is_reader(candidate.bufnr)
+                    and not vim.b[candidate.bufnr].markdown_table_wrap_auxiliary
+                  then
+                    replacement = candidate.bufnr
+                    break
+                  end
+                end
+                replacement = replacement or vim.api.nvim_create_buf(true, false)
+              end
+              set_win_buf_keepjumps(winid, replacement)
+            end
+            pcall(vim.api.nvim_buf_delete, dependent_bufnr, { force = true })
+          end
+        end)
+      end
+    end
+  end
+end
+
+function M.get_state(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  return state and vim.deepcopy(state) or nil
+end
+
+-- Internal consumers should prefer these narrow snapshots over get_state().
+-- The full state contains every rendered line and semantic object, so copying
+-- it for a cursor-local action makes that action scale with the whole Reader.
+function M.summary(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return nil
+  end
+  return {
+    rendered_lines = #(state.lines or {}),
+    source_alt_bufnr = state.source_alt_bufnr,
+  }
+end
+
+function M.line_object(reader_bufnr, row)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  row = tonumber(row)
+  local line_object = state and row and state.line_objects and state.line_objects[row] or nil
+  return type(line_object) == "table" and vim.deepcopy(line_object) or nil
+end
+
+function M.cell_segments(reader_bufnr, cell)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  local key = cell_key(cell)
+  local segments = state and key and state.cell_segments and state.cell_segments[key] or nil
+  return segments and vim.deepcopy(segments) or nil
+end
+
+function M.rendered_table(reader_bufnr, table_id)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or not table_id then
+    return nil
+  end
+  for _, segment in ipairs(state.segments or {}) do
+    if segment.rendered and segment.rendered.table_id == table_id then
+      return vim.deepcopy(segment.rendered)
+    end
+  end
+  return nil
+end
+
+function M.mapping_fallback(reader_bufnr, group, lhs)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return nil
+  end
+  local fallbacks = group == "cell" and state.cell_fallbacks
+    or group == "passthrough" and state.passthrough_fallbacks
+    or nil
+  local mapping = fallbacks and fallbacks[lhs] or nil
+  return mapping and vim.deepcopy(mapping) or nil
+end
+
+function M.source_position(reader_bufnr, winid)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state or not vim.api.nvim_buf_is_valid(state.source_bufnr) then
+    return nil
+  end
+
+  winid = winid or state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return { state.source_bufnr, 1, 0 }
+  end
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local lnum, col = source_cursor_for(state, cursor[1], cursor[2])
+  return { state.source_bufnr, lnum, col }
+end
+
+local function same_cell(left, right)
+  return left
+    and right
+    and left.table_id == right.table_id
+    and left.row_index == right.row_index
+    and left.column_index == right.column_index
+end
+
+function M.cell_at_cursor(reader_bufnr, winid)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return nil
+  end
+
+  winid = winid or state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    winid = vim.fn.win_findbuf(reader_bufnr)[1]
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return nil
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local line_object = state.line_objects[cursor[1]]
+  if type(line_object) ~= "table" then
+    return nil
+  end
+
+  local current
+  for _, cell in ipairs(line_object.cells or {}) do
+    if cursor[2] >= cell.start_col and cursor[2] < cell.end_col then
+      current = cell
+      break
+    end
+  end
+  if not current then
+    return nil
+  end
+
+  local key = cell_key(current)
+  local indexed = key and state.cell_segments and state.cell_segments[key] or nil
+  local start_row
+  local end_row
+  local start_col = current.start_col
+  local end_col = current.end_col
+  if indexed then
+    for _, item in ipairs(indexed) do
+      local row = item.row
+      local cell = item.cell
+      start_row = start_row and math.min(start_row, row) or row
+      end_row = end_row and math.max(end_row, row) or row
+      start_col = math.min(start_col, cell.start_col)
+      end_col = math.max(end_col, cell.end_col)
+    end
+  else
+    for row, object in ipairs(state.line_objects) do
+      if type(object) == "table" then
+        for _, cell in ipairs(object.cells or {}) do
+          if same_cell(cell, current) then
+            start_row = start_row and math.min(start_row, row) or row
+            end_row = end_row and math.max(end_row, row) or row
+            start_col = math.min(start_col, cell.start_col)
+            end_col = math.max(end_col, cell.end_col)
+          end
+        end
+      end
+    end
+  end
+
+  return {
+    source_bufnr = state.source_bufnr,
+    winid = winid,
+    table_id = current.table_id,
+    row_index = current.row_index,
+    column_index = current.column_index,
+    source_span = vim.deepcopy(current.source_span),
+    present = current.present ~= false,
+    text = current.text,
+    render_start_row = start_row or cursor[1],
+    render_end_row = end_row or cursor[1],
+    render_start_col = start_col,
+    render_end_col = end_col,
+  }
+end
+
+function M.focus_source_cell(reader_bufnr, source_lnum, column_index, table_id, row_index)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return false
+  end
+  local winid = state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    winid = vim.fn.win_findbuf(reader_bufnr)[1]
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    return false
+  end
+
+  local key = cell_key({
+    table_id = table_id,
+    row_index = row_index,
+    column_index = column_index,
+  })
+  local indexed = key and state.cell_segments and state.cell_segments[key] or nil
+  local first = indexed and indexed[1] or nil
+  if first then
+    vim.api.nvim_win_set_cursor(winid, { first.row, first.cell.start_col })
+    return true
+  end
+
+  for row, object in ipairs(state.line_objects) do
+    if type(object) == "table" then
+      for _, cell in ipairs(object.cells or {}) do
+        local span = cell.source_span
+        if
+          span
+          and span.start_lnum == source_lnum
+          and cell.column_index == column_index
+          and (not table_id or cell.table_id == table_id)
+        then
+          vim.api.nvim_win_set_cursor(winid, { row, cell.start_col })
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+function M.clear_visual_selection(reader_bufnr)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  if vim.api.nvim_buf_is_valid(reader_bufnr) then
+    vim.api.nvim_buf_clear_namespace(reader_bufnr, visual_namespace, 0, -1)
+  end
+end
+
+function M.update_sticky_header(reader_bufnr, winid)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  local state = states[reader_bufnr]
+  if not state then
+    return false
+  end
+  winid = winid or state.winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    return false
+  end
+  if not (state.config.reader or {}).sticky_header then
+    vim.wo[winid].winbar = state.source_options and state.source_options.winbar or ""
+    return false
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local line_object = state.line_objects[cursor[1]]
+  local table_id = type(line_object) == "table" and line_object.table_id or nil
+  if not table_id then
+    for _, segment in ipairs(state.segments or {}) do
+      if cursor[1] >= segment.start_row + 1 and cursor[1] <= segment.start_row + segment.rendered.height then
+        table_id = segment.rendered.table_id
+        break
+      end
+    end
+  end
+  local headers = table_id and state.table_headers and state.table_headers[table_id] or nil
+  if not headers then
+    vim.wo[winid].winbar = state.source_options and state.source_options.winbar or ""
+    return false
+  end
+  local values = {}
+  local header_rows = vim.tbl_keys(headers)
+  table.sort(header_rows)
+  for _, row in ipairs(header_rows) do
+    table.insert(values, headers[row])
+  end
+  local text = table.concat(values, " / "):gsub("%%", "%%%%")
+  vim.wo[winid].winbar = text ~= "" and (" " .. text) or ""
+  return text ~= ""
+end
+
+local function display_glyphs(line)
+  local result = {}
+  for ch, first, last in utf8.iter(line) do
+    local previous = result[#result]
+    if previous and vim.fn.strdisplaywidth("a" .. ch) == 1 then
+      previous.text = previous.text .. ch
+      previous.last = last
+    else
+      result[#result + 1] = { text = ch, first = first, last = last }
+    end
+  end
+  return result
+end
+
+local function next_char_end(line, start_col)
+  start_col = math.max(0, math.min(#line, start_col or 0))
+  for _, glyph in ipairs(display_glyphs(line)) do
+    if glyph.last > start_col then
+      return glyph.last
+    end
+  end
+  return #line
+end
+
+-- Convert a native blockwise Visual rectangle (display columns) into a
+-- byte-safe range for one line.  getpos() exposes byte columns, but block
+-- Visual is defined in screen cells; reusing an anchor byte range on a line
+-- containing CJK/emoji would select a different glyph or the next border.
+local function byte_range_for_display_columns(line, first_vcol, last_vcol)
+  local display_col = 1
+  local start_col
+  local end_col
+  for _, glyph in ipairs(display_glyphs(line)) do
+    local char_width = vim.fn.strdisplaywidth(glyph.text, display_col - 1)
+    local char_start = display_col
+    local char_end = display_col + math.max(char_width, 1) - 1
+    if char_end >= first_vcol and char_start <= last_vcol then
+      start_col = start_col or glyph.first
+      end_col = glyph.last
+    elseif start_col and char_width > 0 and char_start > last_vcol then
+      break
+    end
+    display_col = display_col + char_width
+  end
+  return start_col, end_col
+end
+
+local function append_visual_chunk(chunks, text, hl_group)
+  if text == "" then
+    return
+  end
+  local previous = chunks[#chunks]
+  if previous and previous[2] == hl_group then
+    previous[1] = previous[1] .. text
+  else
+    table.insert(chunks, { text, hl_group })
+  end
+end
+
+-- The Reader's base table extmark conceals the real line and redraws it from
+-- column zero.  A second overlay beginning inside that concealment does not
+-- reliably replace the same screen cells.  Redraw a selected line completely
+-- at column zero instead, retaining semantic normal chunks around the exact
+-- Visual byte ranges.
+local function visual_line_chunks(line_obj, line_index, ranges)
+  local result = {}
+  local offset = 0
+  local range_index = 1
+  local base = reader_display_chunks(line_obj, line_index)
+
+  for _, chunk in ipairs(base) do
+    local text = chunk[1]
+    local normal_hl = chunk[2]
+    local chunk_start = offset
+    local chunk_end = offset + #text
+    local cursor = chunk_start
+
+    while range_index <= #ranges and ranges[range_index].end_col <= chunk_start do
+      range_index = range_index + 1
+    end
+    local active = range_index
+    while active <= #ranges and ranges[active].start_col < chunk_end do
+      local selected = ranges[active]
+      local selected_start = math.max(cursor, selected.start_col, chunk_start)
+      local selected_end = math.min(chunk_end, selected.end_col)
+      if selected_start > cursor then
+        append_visual_chunk(result, text:sub(cursor - chunk_start + 1, selected_start - chunk_start), normal_hl)
+      end
+      if selected_end > selected_start then
+        append_visual_chunk(result, text:sub(selected_start - chunk_start + 1, selected_end - chunk_start), "Visual")
+        cursor = selected_end
+      end
+      if selected.end_col <= chunk_end then
+        active = active + 1
+      else
+        break
+      end
+    end
+    if cursor < chunk_end then
+      append_visual_chunk(result, text:sub(cursor - chunk_start + 1), normal_hl)
+    end
+    offset = chunk_end
+  end
+  return result
+end
+
+local function table_line_index(state, lnum)
+  for _, segment in ipairs(state.segments or {}) do
+    local index = lnum - segment.start_row
+    if index >= 1 and index <= #(segment.rendered.line_objects or {}) then
+      return index
+    end
+  end
+  return nil
+end
+
+local function set_visual_line(reader_bufnr, state, lnum, ranges, priority)
+  if not state.table_rows[lnum] then
+    return false
+  end
+  local line_object = state.line_objects[lnum]
+  local line_index = table_line_index(state, lnum)
+  if type(line_object) ~= "table" or not line_index or #ranges == 0 then
+    return false
+  end
+  local chunks = visual_line_chunks(line_object, line_index, ranges)
+  if #chunks == 0 then
+    return false
+  end
+  vim.api.nvim_buf_set_extmark(reader_bufnr, visual_namespace, lnum - 1, 0, {
+    virt_text = chunks,
+    virt_text_pos = "overlay",
+    hl_mode = "replace",
+    right_gravity = false,
+    priority = priority,
+  })
+  return true
+end
+
+local function visual_bounds(reader_bufnr, winid)
+  local mode = vim.api.nvim_get_mode().mode
+  if not mode:match("^[vV\22]") then
+    return nil
+  end
+
+  local state = states[reader_bufnr]
+  if not state then
+    return nil
+  end
+  local anchor = vim.fn.getpos("v")
+  if type(anchor) ~= "table" then
+    return nil
+  end
+  -- getpos() returns {bufnum, lnum, col, off}; unlike nvim_win_get_cursor(),
+  -- its line and column fields are 1-based.  A zero buffer number means the
+  -- current buffer, so only reject an explicit anchor from another buffer.
+  if anchor[1] and anchor[1] ~= 0 and anchor[1] ~= reader_bufnr then
+    return nil
+  end
+  local anchor_lnum = anchor[2]
+  local anchor_col = math.max((anchor[3] or 1) - 1, 0)
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local first_lnum = math.min(anchor_lnum, cursor[1])
+  local last_lnum = math.max(anchor_lnum, cursor[1])
+  local first_col
+  local last_col
+  local first_vcol
+  local last_vcol
+  if mode == "V" then
+    first_col = 0
+    last_col = math.huge
+  elseif mode == "\22" then
+    first_col = 0
+    last_col = math.huge
+    first_vcol = math.min(vim.fn.virtcol("v"), vim.fn.virtcol("."))
+    last_vcol = math.max(vim.fn.virtcol("v"), vim.fn.virtcol("."))
+    if vim.o.selection == "exclusive" and last_vcol > first_vcol then
+      last_vcol = last_vcol - 1
+    end
+  elseif anchor_lnum < cursor[1] then
+    first_col = anchor_col
+    last_col = cursor[2]
+  elseif cursor[1] < anchor_lnum then
+    first_col = cursor[2]
+    last_col = anchor_col
+  else
+    first_col = math.min(anchor_col, cursor[2])
+    last_col = math.max(anchor_col, cursor[2])
+  end
+  return mode, first_lnum, last_lnum, first_col, last_col, first_vcol, last_vcol
+end
+
+local function update_logical_cell_visual(reader_bufnr, state)
+  local marker = vim.b[reader_bufnr].markdown_table_wrap_cell_visual
+  if type(marker) ~= "table" then
+    return false
+  end
+
+  local key = table.concat({ marker.table_id, marker.row_index, marker.column_index }, ":")
+  local segments = state.cell_segments and state.cell_segments[key] or nil
+  if not segments or #segments == 0 then
+    return false
+  end
+
+  local priority = math.max((state.config.overlay_priority or 10000) + 1, 10001)
+  for _, item in ipairs(segments) do
+    local row = item.row
+    local cell = item.cell
+    local line = vim.api.nvim_buf_get_lines(reader_bufnr, row - 1, row, false)[1] or ""
+    local start_col = math.max(0, math.min(#line, cell.start_col or 0))
+    local end_col = math.max(start_col, math.min(#line, cell.end_col or start_col))
+    if end_col > start_col then
+      set_visual_line(reader_bufnr, state, row, { { start_col = start_col, end_col = end_col } }, priority)
+    end
+  end
+  return true
+end
+
+function M.update_visual_selection(reader_bufnr, winid)
+  reader_bufnr = normalize_bufnr(reader_bufnr)
+  M.clear_visual_selection(reader_bufnr)
+  if not states[reader_bufnr] then
+    return false
+  end
+
+  winid = winid or states[reader_bufnr].winid
+  if not winid or not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_win_get_buf(winid) ~= reader_bufnr then
+    return false
+  end
+  local state = states[reader_bufnr]
+  if vim.api.nvim_get_mode().mode == "\22" and update_logical_cell_visual(reader_bufnr, state) then
+    return true
+  end
+  local mode, first_lnum, last_lnum, first_col, last_col, first_vcol, last_vcol = visual_bounds(reader_bufnr, winid)
+  if not mode then
+    return false
+  end
+
+  local priority = math.max((states[reader_bufnr].config.overlay_priority or 10000) + 1, 10001)
+  for lnum = first_lnum, last_lnum do
+    local line = vim.api.nvim_buf_get_lines(reader_bufnr, lnum - 1, lnum, false)[1] or ""
+    local start_col
+    local end_col
+    if mode == "V" then
+      start_col, end_col = 0, #line
+    elseif mode == "\22" then
+      start_col, end_col = byte_range_for_display_columns(line, first_vcol, last_vcol)
+    else
+      start_col = lnum == first_lnum and first_col or 0
+      local end_cursor_col = lnum == last_lnum and last_col or #line
+      end_col = lnum == last_lnum and next_char_end(line, end_cursor_col) or #line
+      if
+        vim.o.selection == "exclusive"
+        and lnum == last_lnum
+        and (first_lnum ~= last_lnum or first_col ~= last_col)
+      then
+        end_col = end_cursor_col
+      end
+    end
+    if start_col and end_col and end_col > start_col then
+      set_visual_line(reader_bufnr, state, lnum, { { start_col = start_col, end_col = end_col } }, priority)
+    end
+  end
+  return true
+end
+
+function M.namespace()
+  return namespace
+end
+
+function M.visual_namespace()
+  return visual_namespace
+end
+
+function M._build(source_bufnr, config)
+  return build(source_bufnr, config)
+end
+
+return M

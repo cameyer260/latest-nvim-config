@@ -8,8 +8,12 @@ if vim.g.have_nerd_font then
 end
 vim.pack.add(plugins)
 
+local reader_buffers = require 'custom.markdown_reader_bufferline'
+
 require('bufferline').setup {
   options = {
+    close_command = reader_buffers.close_buffer,
+    right_mouse_command = reader_buffers.close_buffer,
     diagnostics = 'nvim_lsp', -- show LSP error/warning counts on each tab
     show_buffer_close_icons = true,
     show_close_icon = false,
@@ -19,6 +23,9 @@ require('bufferline').setup {
     },
   },
 }
+
+-- Reader is unlisted; keep its backing Markdown file selected in the tab strip.
+reader_buffers.setup()
 
 local map = vim.keymap.set
 
@@ -31,7 +38,7 @@ map('n', '<leader>b<', '<Cmd>BufferLineMovePrev<CR>', { desc = 'Move tab left' }
 map('n', '<leader>b>', '<Cmd>BufferLineMoveNext<CR>', { desc = 'Move tab right' })
 
 -- Close the current tab (keeps your window layout intact).
-map('n', '<leader>bd', '<Cmd>bdelete<CR>', { desc = 'Close tab (buffer)' })
+map('n', '<leader>bd', reader_buffers.close_buffer, { desc = 'Close tab (buffer)' })
 -- Close every tab except the current one.
 map('n', '<leader>bo', '<Cmd>BufferLineCloseOthers<CR>', { desc = 'Close other tabs' })
 -- New empty tab; then `:w name.ext` to name + create the file on disk.
