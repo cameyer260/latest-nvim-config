@@ -116,6 +116,11 @@ do
   -- Enable mouse mode, can be useful for resizing splits for example!
   vim.o.mouse = 'a'
 
+  -- Ghostty sends one mouse-wheel report per scrolled line (9 reports per
+  -- notch on macOS by default). Neovim's default of 3 lines per report would
+  -- make one notch scroll 27 lines. One line per report matches other TUIs.
+  vim.o.mousescroll = 'ver:1'
+
   -- Don't show the mode, since it's already in the status line
   vim.o.showmode = false
 
